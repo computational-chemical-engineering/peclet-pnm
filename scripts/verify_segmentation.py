@@ -2,75 +2,65 @@ import sys
 import os
 import struct
 import numpy as np
+import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../build')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../cfd_utils')))
 import pnm_backend
+from vti import save_vti
 
-def save_vti_labeled(filename, labels, shape, origin, spacing):
-    # Save int32 labeled volume
-    nx, ny, nz = shape
-    data_bytes = labels.tobytes()
+def verify_segmentation(input_file, output_file, edge_file):
+    print(f"Reading {input_file}...")
+    # New Binding returns: (numpy_array_3d, origin_zyx, spacing_zyx)
+    sdf_3d, origin, spacing = pnm_backend.SDFReader.read_vti(input_file)
     
-    header = f"""<VTKFile type="ImageData" version="1.0" byte_order="LittleEndian" header_type="UInt64">
-  <ImageData WholeExtent="0 {nx-1} 0 {ny-1} 0 {nz-1}" Origin="{origin[0]} {origin[1]} {origin[2]}" Spacing="{spacing[0]} {spacing[1]} {spacing[2]}">
-    <Piece Extent="0 {nx-1} 0 {ny-1} 0 {nz-1}">
-      <PointData Scalars="Labels">
-        <DataArray type="Int32" Name="Labels" format="appended" offset="0"/>
-      </PointData>
-      <CellData>
-      </CellData>
-    </Piece>
-  </ImageData>
-  <AppendedData encoding="raw">
-_"""
-    with open(filename, 'wb') as f:
-        f.write(header.encode('ascii'))
-        f.write(struct.pack('<Q', len(data_bytes)))
-        f.write(data_bytes)
-    print(f"Saved labeled volume to {filename}")
-
-def verify_segmentation(filename):
-    print(f"Reading {filename}...")
-    sdf_data = pnm_backend.SDFReader.read_vti(filename)
+    # Resolution/Shape is now inherent in the array
+    shape = sdf_3d.shape
+    print(f"Grid Shape (Nz, Ny, Nx): {shape}")
     
     print("Running Segmentation...")
-    segmentation = pnm_backend.segment_volume(sdf_data)
+    # Updated binding accepts the 3D array and ZYX spacing
+    segmentation_flat = pnm_backend.segment_volume(sdf_3d, spacing)
     
-    seg_array = np.array(segmentation, dtype=np.int32)
-    # Convert flattened to 3D
-    # Note: Pybind returned flat vector.
-    # Dimensions: Z, Y, X
-    nz, ny, nx = sdf_data.resolution[2], sdf_data.resolution[1], sdf_data.resolution[0]
+    # Reshape the flat result to our 3D convention
+    seg_3d = np.array(segmentation_flat, dtype=np.int32).reshape(shape)
     
-    print(f"Segmentation Elements: {len(seg_array)}")
+    # Stats logic
+    unique_labels = np.unique(seg_3d)
+    pores = unique_labels[unique_labels > 0]
+    solids = unique_labels[unique_labels < 0]
     
-    pores = np.unique(seg_array[seg_array > 0])
-    solids = np.unique(seg_array[seg_array < 0])
-    
-    print(f"Total Labels: {len(np.unique(seg_array))}")
+    print(f"Total Labels: {len(unique_labels)}")
     print(f"Pore IDs: {len(pores)}")
     print(f"Solid IDs: {len(solids)}")
     
-    # Save output
-    save_vti_labeled("segmentation.vti", seg_array, sdf_data.resolution, sdf_data.origin, sdf_data.spacing)
+    # Save output using the general saver
+    print(f"Saving segmented volume to {output_file}...")
+    save_vti(output_file, 
+             fields={"Labels": seg_3d, "SDF": sdf_3d}, 
+             spacing=spacing, 
+             origin=origin)
     
     print("Extracting Topology...")
-    connections = pnm_backend.extract_topology(segmentation, sdf_data.resolution)
+    # Note: If extract_topology_gpu still needs the {nx, ny, nz} list for its 
+    # internal logic, we reverse our ZYX shape back to XYZ: shape[::-1]
+    connections = pnm_backend.extract_topology_gpu(segmentation_flat, shape[::-1])
     print(f"Found {len(connections)} connections.")
     
-    # Save topology? simple text file or edge list
-    with open("network.edges", "w") as f:
+    with open(edge_file, "w") as f:
         for u, v in connections:
             f.write(f"{u} {v}\n")
-    print("Saved network.edges")
+    print(f"Saved {edge_file}")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        verify_segmentation(sys.argv[1])
+    parser = argparse.ArgumentParser(description="PNM Segmentation Verification")
+    parser.add_argument("input", help="Input SDF VTI file")
+    parser.add_argument("-o", "--output", default="segmentation.vti", help="Output Labels VTI")
+    parser.add_argument("-e", "--edges", default="network.edges", help="Output edge list")
+    
+    args = parser.parse_args()
+
+    if os.path.exists(args.input):
+        verify_segmentation(args.input, args.output, args.edges)
     else:
-        # Default to a file in data/ if exists
-        default_file = "data/packing_ring.vti"
-        if os.path.exists(default_file):
-            verify_segmentation(default_file)
-        else:
-            print(f"Usage: {sys.argv[0]} <vti_file>")
+        print(f"Error: {args.input} not found.")
