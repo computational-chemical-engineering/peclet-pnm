@@ -1,3 +1,4 @@
+"""Verify the SDF segmentation / geometry import."""
 import sys
 import os
 import struct

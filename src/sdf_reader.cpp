@@ -1,3 +1,5 @@
+/// @file
+/// @brief Reader for SDF / VTI geometry (implementation).
 #include "sdf_reader.h"
 
 #include <algorithm>

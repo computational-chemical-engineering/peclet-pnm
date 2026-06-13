@@ -1,3 +1,5 @@
+/// @file
+/// @brief Pore-network extraction from an SDF (implementation).
 #include "pore_extraction.cuh"
 #include <algorithm>
 #include <cuda_runtime.h>

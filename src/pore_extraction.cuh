@@ -1,3 +1,5 @@
+/// @file
+/// @brief Pore-network extraction from an SDF (interface).
 #pragma once
 
 #include "sdf_reader.h"

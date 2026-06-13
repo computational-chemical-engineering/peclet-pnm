@@ -1,3 +1,4 @@
+"""Smoke test for pore-network extraction from an SDF."""
 import sys
 import os
 

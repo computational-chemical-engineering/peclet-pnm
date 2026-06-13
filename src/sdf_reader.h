@@ -1,3 +1,5 @@
+/// @file
+/// @brief Reader for SDF / VTI geometry (interface).
 #pragma once
 
 #include <vector>
