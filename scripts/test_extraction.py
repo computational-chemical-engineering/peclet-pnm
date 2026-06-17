@@ -7,11 +7,11 @@ import pnm_backend
 
 def test_extraction(filename):
     print(f"Reading {filename}...")
-    sdf_data = pnm_backend.SDFReader.read_vti(filename)
-    print(f"Loaded SDF. Shape: {sdf_data.resolution}")
-    
+    sdf_3d, origin_zyx, spacing_zyx = pnm_backend.SDFReader.read_vti(filename)
+    print(f"Loaded SDF. Shape: {sdf_3d.shape}")
+
     print("Extracting pores on GPU...")
-    pores = pnm_backend.extract_pores(sdf_data)
+    pores = pnm_backend.extract_pores(sdf_3d, origin_zyx, spacing_zyx)
     
     print(f"Found {len(pores)} pores.")
     if len(pores) > 0:
