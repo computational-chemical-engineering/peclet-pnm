@@ -6,8 +6,8 @@
 // Kokkos::parallel_for, atomicAdd/atomicMin -> Kokkos::atomic_*, cudaMalloc/Memcpy -> Kokkos::View +
 // deep_copy. The thrust includes in the .cu were dead (sort/unique is host std::sort). Host orchestration
 // (label renumber via std::map, topology sort/unique) stays on the host. Runs on any Kokkos backend.
-#ifndef CFD_PORE_EXTRACTION_KOKKOS_HPP
-#define CFD_PORE_EXTRACTION_KOKKOS_HPP
+#ifndef CFD_PORE_EXTRACTION_HPP
+#define CFD_PORE_EXTRACTION_HPP
 
 #include <Kokkos_Core.hpp>
 
@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-namespace pnmk {
+namespace pnm {
 
 struct Pore { float x, y, z, radius; };
 struct I3 { int x, y, z; };
@@ -54,7 +54,7 @@ inline std::vector<Pore> extract_pores_k(const std::vector<float>& sdf_h, std::a
   Exec space;
   using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
   Kokkos::parallel_for(
-      "pnmk::extract_pores", MD(space, {0, 0, 0}, {res.x, res.y, res.z}),
+      "pnm::extract_pores", MD(space, {0, 0, 0}, {res.x, res.y, res.z}),
       KOKKOS_LAMBDA(int ix, int iy, int iz) {
         const int ci = get_idx(ix, iy, iz, res);
         const float cv = sdf(ci);
@@ -115,7 +115,7 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h, std::a
   const auto full = MD(space, {0, 0, 0}, {res.x, res.y, res.z});
 
   // 1. init markers (deep solid -> own index, else -1)
-  Kokkos::parallel_for("pnmk::init_markers", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+  Kokkos::parallel_for("pnm::init_markers", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
     const int i = get_idx(ix, iy, iz, res);
     labels(i) = (sdf(i) < thr) ? i : -1;
   });
@@ -123,7 +123,7 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h, std::a
 
   // 2. union-find CCL on markers (26-connectivity, 13 forward neighbours) + path compression, to fixpoint
   auto flatten = [&]() {
-    Kokkos::parallel_for("pnmk::flatten", Kokkos::RangePolicy<Exec>(space, 0, n), KOKKOS_LAMBDA(std::size_t idx) {
+    Kokkos::parallel_for("pnm::flatten", Kokkos::RangePolicy<Exec>(space, 0, n), KOKKOS_LAMBDA(std::size_t idx) {
       int l = labels(idx);
       if (l != -1) { while (l != labels(l)) l = labels(l); labels(idx) = l; }
     });
@@ -132,7 +132,7 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h, std::a
   int h_changed = 1;
   while (h_changed) {
     Kokkos::deep_copy(changed, 0);
-    Kokkos::parallel_for("pnmk::merge_markers", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+    Kokkos::parallel_for("pnm::merge_markers", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
       const int idx = get_idx(ix, iy, iz, res);
       const int my = labels(idx);
       if (my == -1) return;
@@ -162,7 +162,7 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h, std::a
   h_changed = 1;
   while (h_changed) {
     Kokkos::deep_copy(changed, 0);
-    Kokkos::parallel_for("pnmk::flood", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+    Kokkos::parallel_for("pnm::flood", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
       const int idx = get_idx(ix, iy, iz, res);
       if (sdf(idx) >= 0.0f) return;          // pore: ignore
       if (labels(idx) != -1) return;         // already labelled
@@ -181,7 +181,7 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h, std::a
   }
 
   // 4. gradient-path pore basins (ascent for pores, descent for solids; 26-connectivity, tie-break on index)
-  Kokkos::parallel_for("pnmk::gradient_path", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+  Kokkos::parallel_for("pnm::gradient_path", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
     const int ci = get_idx(ix, iy, iz, res);
     const bool ascent = (sdf(ci) > 0.0f);
     int walker = ci; const int MAX_STEPS = 512;
@@ -244,7 +244,7 @@ inline std::vector<std::pair<int, int>> extract_topology_k(const std::vector<int
   Exec space;
   using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
   Kokkos::parallel_for(
-      "pnmk::boundary_pairs", MD(space, {0, 0, 0}, {res.x, res.y, res.z}),
+      "pnm::boundary_pairs", MD(space, {0, 0, 0}, {res.x, res.y, res.z}),
       KOKKOS_LAMBDA(int ix, int iy, int iz) {
         const int idx = get_idx(ix, iy, iz, res);
         const int my = seg(idx);
@@ -270,6 +270,6 @@ inline std::vector<std::pair<int, int>> extract_topology_k(const std::vector<int
   return result;
 }
 
-}  // namespace pnmk
+}  // namespace pnm
 
-#endif  // CFD_PORE_EXTRACTION_KOKKOS_HPP
+#endif  // CFD_PORE_EXTRACTION_HPP

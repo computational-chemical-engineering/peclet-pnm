@@ -9,13 +9,13 @@
 #include <array>
 #include <vector>
 
-#include "pore_extraction_kokkos.hpp"
+#include "pore_extraction.hpp"
 #include "sdf_reader.h"
 
 namespace py = pybind11;
-using pnmk::Pore;
+using pnm::Pore;
 
-PYBIND11_MODULE(pnm_kokkos, m) {
+PYBIND11_MODULE(pnm_backend, m) {
   m.doc() = "cfd-gpu pore-network extraction (Kokkos)";
   if (!Kokkos::is_initialized()) Kokkos::initialize();
   py::module_::import("atexit").attr("register")(py::cpp_function([]() {
@@ -59,7 +59,7 @@ PYBIND11_MODULE(pnm_kokkos, m) {
           std::array<int, 3> res; auto v = to_sdf(sdf, res);
           std::array<float, 3> org{(float)origin_zyx[2], (float)origin_zyx[1], (float)origin_zyx[0]};
           std::array<float, 3> spc{(float)spacing_zyx[2], (float)spacing_zyx[1], (float)spacing_zyx[0]};
-          return pnmk::extract_pores_k(v, res, org, spc);
+          return pnm::extract_pores_k(v, res, org, spc);
         }, py::arg("sdf"), py::arg("origin_zyx"), py::arg("spacing_zyx"));
 
   m.def("segment_volume",
@@ -67,12 +67,12 @@ PYBIND11_MODULE(pnm_kokkos, m) {
                  std::vector<double> spacing_zyx) {
           std::array<int, 3> res; auto v = to_sdf(sdf, res);
           std::array<float, 3> spc{(float)spacing_zyx[2], (float)spacing_zyx[1], (float)spacing_zyx[0]};
-          return pnmk::segment_volume_k(v, res, spc);
+          return pnm::segment_volume_k(v, res, spc);
         }, py::arg("sdf"), py::arg("spacing_zyx"));
 
   m.def("extract_topology_gpu",
         [](std::vector<int> segmentation, std::vector<int> shape_zyx) {
           std::array<int, 3> res{shape_zyx[2], shape_zyx[1], shape_zyx[0]};
-          return pnmk::extract_topology_k(segmentation, res);
+          return pnm::extract_topology_k(segmentation, res);
         }, py::arg("segmentation"), py::arg("shape"));
 }
