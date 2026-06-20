@@ -1,6 +1,6 @@
-// cfd-gpu — pybind11 module for the Kokkos pore-network extraction (drop-in for pnm_backend's compute
-// API). Matches pnm_backend's numpy convention: SDF is (Nz,Ny,Nx) C-order, origin/spacing are zyx.
-// VTI reading (SDFReader) stays in the CUDA-free pnm_backend; this module is the GPU compute port.
+// cfd-gpu — pybind11 module for the Kokkos pore-network extraction (the canonical pnm_backend). Matches the
+// numpy convention: SDF is (Nz,Ny,Nx) C-order, origin/spacing are zyx. VTI reading (SDFReader) is pure C++
+// (sdf_reader.cpp, CUDA-free); the pore/segmentation/topology compute is the Kokkos GPU port.
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "pore_extraction_kokkos.hpp"
+#include "sdf_reader.h"
 
 namespace py = pybind11;
 using pnmk::Pore;
@@ -21,6 +22,23 @@ PYBIND11_MODULE(pnm_kokkos, m) {
     if (Kokkos::is_initialized() && !Kokkos::is_finalized()) Kokkos::finalize();
   }));
   m.attr("execution_space") = py::str(Kokkos::DefaultExecutionSpace::name());
+
+  // VTI reader (pure C++; sdf_reader.cpp). Returns (sdf_3d[nz,ny,nx], origin_zyx, spacing_zyx).
+  py::class_<SDFReader>(m, "SDFReader")
+      .def_static(
+          "read_vti",
+          [](const std::string& filename) {
+            auto* data = new SDFData(SDFReader::read_vti(filename));
+            std::vector<py::ssize_t> shape{(py::ssize_t)data->resolution[2],
+                                           (py::ssize_t)data->resolution[1],
+                                           (py::ssize_t)data->resolution[0]};
+            std::vector<double> org{data->origin[2], data->origin[1], data->origin[0]};
+            std::vector<double> spc{data->spacing[2], data->spacing[1], data->spacing[0]};
+            py::capsule free_when_done(data, [](void* f) { delete reinterpret_cast<SDFData*>(f); });
+            auto sdf_3d = py::array_t<float>(shape, data->sdf_values.data(), free_when_done);
+            return py::make_tuple(sdf_3d, org, spc);
+          },
+          "Reads VTI; returns (sdf_3d[nz,ny,nx], origin_zyx, spacing_zyx)");
 
   py::class_<Pore>(m, "Pore")
       .def_readwrite("x", &Pore::x).def_readwrite("y", &Pore::y)
