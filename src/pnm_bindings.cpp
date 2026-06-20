@@ -15,7 +15,7 @@
 namespace py = pybind11;
 using pnm::Pore;
 
-PYBIND11_MODULE(pnm_backend, m) {
+PYBIND11_MODULE(pnm, m) {
   m.doc() = "cfd-gpu pore-network extraction (Kokkos)";
   if (!Kokkos::is_initialized()) Kokkos::initialize();
   py::module_::import("atexit").attr("register")(py::cpp_function([]() {

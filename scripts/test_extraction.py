@@ -3,15 +3,15 @@ import sys
 import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../build')))
-import pnm_backend
+import pnm
 
 def test_extraction(filename):
     print(f"Reading {filename}...")
-    sdf_3d, origin_zyx, spacing_zyx = pnm_backend.SDFReader.read_vti(filename)
+    sdf_3d, origin_zyx, spacing_zyx = pnm.SDFReader.read_vti(filename)
     print(f"Loaded SDF. Shape: {sdf_3d.shape}")
 
     print("Extracting pores on GPU...")
-    pores = pnm_backend.extract_pores(sdf_3d, origin_zyx, spacing_zyx)
+    pores = pnm.extract_pores(sdf_3d, origin_zyx, spacing_zyx)
     
     print(f"Found {len(pores)} pores.")
     if len(pores) > 0:

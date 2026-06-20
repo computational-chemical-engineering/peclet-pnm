@@ -7,13 +7,13 @@ import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../build')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../cfd_utils')))
-import pnm_backend
+import pnm
 from vti import save_vti
 
 def verify_segmentation(input_file, output_file, edge_file):
     print(f"Reading {input_file}...")
     # New Binding returns: (numpy_array_3d, origin_zyx, spacing_zyx)
-    sdf_3d, origin, spacing = pnm_backend.SDFReader.read_vti(input_file)
+    sdf_3d, origin, spacing = pnm.SDFReader.read_vti(input_file)
     
     # Resolution/Shape is now inherent in the array
     shape = sdf_3d.shape
@@ -21,7 +21,7 @@ def verify_segmentation(input_file, output_file, edge_file):
     
     print("Running Segmentation...")
     # Updated binding accepts the 3D array and ZYX spacing
-    segmentation_flat = pnm_backend.segment_volume(sdf_3d, spacing)
+    segmentation_flat = pnm.segment_volume(sdf_3d, spacing)
     
     # Reshape the flat result to our 3D convention
     seg_3d = np.array(segmentation_flat, dtype=np.int32).reshape(shape)
@@ -45,7 +45,7 @@ def verify_segmentation(input_file, output_file, edge_file):
     print("Extracting Topology...")
     # Note: If extract_topology_gpu still needs the {nx, ny, nz} list for its 
     # internal logic, we reverse our ZYX shape back to XYZ: shape[::-1]
-    connections = pnm_backend.extract_topology_gpu(segmentation_flat, shape[::-1])
+    connections = pnm.extract_topology_gpu(segmentation_flat, shape[::-1])
     print(f"Found {len(connections)} connections.")
     
     with open(edge_file, "w") as f:
