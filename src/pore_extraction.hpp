@@ -1,11 +1,12 @@
-// cfd-gpu — portable (Kokkos) pore-network extraction from an SDF.
-//
-// Kokkos port of pore_extraction.cu (the pnm_backend module): pore detection (local maxima + weighted
-// centroid), marker-controlled watershed segmentation of the solid (init markers -> union-find CCL ->
-// flood fill), gradient-path pore basins, and boundary-pair topology. Grid-stride __global__ kernels ->
-// Kokkos::parallel_for, atomicAdd/atomicMin -> Kokkos::atomic_*, cudaMalloc/Memcpy -> Kokkos::View +
-// deep_copy. The thrust includes in the .cu were dead (sort/unique is host std::sort). Host orchestration
-// (label renumber via std::map, topology sort/unique) stays on the host. Runs on any Kokkos backend.
+/// @file
+/// @brief sdflow — portable (Kokkos) pore-network extraction from an SDF.
+///
+/// Kokkos port of pore_extraction.cu (the pnm_backend module): pore detection (local maxima + weighted
+/// centroid), marker-controlled watershed segmentation of the solid (init markers -> union-find CCL ->
+/// flood fill), gradient-path pore basins, and boundary-pair topology. Grid-stride __global__ kernels ->
+/// Kokkos::parallel_for, atomicAdd/atomicMin -> Kokkos::atomic_*, cudaMalloc/Memcpy -> Kokkos::View +
+/// deep_copy. The thrust includes in the .cu were dead (sort/unique is host std::sort). Host orchestration
+/// (label renumber via std::map, topology sort/unique) stays on the host. Runs on any Kokkos backend.
 #ifndef CFD_PORE_EXTRACTION_HPP
 #define CFD_PORE_EXTRACTION_HPP
 

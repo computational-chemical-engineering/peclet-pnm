@@ -1,6 +1,9 @@
-// cfd-gpu — pybind11 module for the Kokkos pore-network extraction (the canonical pnm_backend). Matches the
-// numpy convention: SDF is (Nz,Ny,Nx) C-order, origin/spacing are zyx. VTI reading (SDFReader) is pure C++
-// (sdf_reader.cpp, CUDA-free); the pore/segmentation/topology compute is the Kokkos GPU port.
+/// @file
+/// @brief pybind11 module `pnm` — Kokkos pore-network extraction from SDF geometry.
+///
+/// Matches the numpy convention: SDF is (Nz,Ny,Nx) C-order, origin/spacing are zyx. VTI reading
+/// (SDFReader) is pure C++ (sdf_reader.cpp, backend-free); the pore/segmentation/topology compute is
+/// the Kokkos GPU port. Exposes `SDFReader`, `extract_pores`, `segment_volume`, `extract_topology_gpu`.
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -16,7 +19,7 @@ namespace py = pybind11;
 using pnm::Pore;
 
 PYBIND11_MODULE(pnm, m) {
-  m.doc() = "cfd-gpu pore-network extraction (Kokkos)";
+  m.doc() = "pnm — pore-network extraction from SDF geometry (Kokkos)";
   if (!Kokkos::is_initialized()) Kokkos::initialize();
   py::module_::import("atexit").attr("register")(py::cpp_function([]() {
     if (Kokkos::is_initialized() && !Kokkos::is_finalized()) Kokkos::finalize();
