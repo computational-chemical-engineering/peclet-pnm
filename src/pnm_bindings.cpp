@@ -33,8 +33,12 @@ static std::vector<float> to_sdf(nb::ndarray<float, nb::c_contig> a, std::array<
 NB_MODULE(pnm, m) {
   m.attr("__doc__") = "pnm — pore-network extraction from SDF geometry (Kokkos)";
   if (!Kokkos::is_initialized()) Kokkos::initialize();
-  // No atexit Kokkos::finalize (see sdflow_bindings.cpp): returned arrays may own Kokkos memory that
-  // outlives an atexit hook. Leaving Kokkos initialized until process teardown is benign.
+  // atexit Kokkos::finalize is REQUIRED on CUDA (else cudaErrorCudartUnloading at exit when Kokkos's
+  // device state outlives the CUDA runtime). pnm returns host-vector-backed arrays, so finalize is
+  // always clean here. See sdflow_bindings.cpp.
+  nb::module_::import_("atexit").attr("register")(nb::cpp_function([]() {
+    if (Kokkos::is_initialized() && !Kokkos::is_finalized()) Kokkos::finalize();
+  }));
   m.attr("execution_space") = nb::str(Kokkos::DefaultExecutionSpace::name());
 
   // VTI reader (pure C++; sdf_reader.cpp). Returns (sdf_3d[nz,ny,nx], origin_zyx, spacing_zyx).
