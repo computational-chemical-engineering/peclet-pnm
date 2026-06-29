@@ -27,6 +27,29 @@ struct I3 { int x, y, z; };
 using Exec = Kokkos::DefaultExecutionSpace;
 using Mem = Exec::memory_space;
 
+/// Bulk host->device upload of a whole std::vector via one deep_copy over an unmanaged host view —
+/// replaces the per-element `create_mirror_view` + fill loop (F3). `d` must already be sized to `h`.
+template <class T>
+inline void uploadVec(const std::vector<T>& h, const Kokkos::View<T*, Mem>& d) {
+  if (h.empty()) return;
+  Kokkos::deep_copy(
+      d, Kokkos::View<const T*, Kokkos::HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(h.data(),
+                                                                                            h.size()));
+}
+
+/// Download the first `count` elements of a device view into a fresh std::vector via one deep_copy —
+/// replaces the `create_mirror_view` (whole view) + element loop (S2/G1), and only moves what is used.
+template <class V>
+inline std::vector<typename V::value_type> downloadN(const V& d, std::size_t count) {
+  std::vector<typename V::value_type> out(count);
+  if (count)
+    Kokkos::deep_copy(
+        Kokkos::View<typename V::value_type*, Kokkos::HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
+            out.data(), count),
+        Kokkos::subview(d, Kokkos::make_pair(std::size_t(0), count)));
+  return out;
+}
+
 KOKKOS_INLINE_FUNCTION int get_idx(int x, int y, int z, I3 res) {
   x = (x % res.x + res.x) % res.x;
   y = (y % res.y + res.y) % res.y;
@@ -47,9 +70,7 @@ inline std::vector<Pore> extract_pores_k(const std::vector<float>& sdf_h, std::a
   Kokkos::View<float*, Mem> sdf("sdf", n);
   Kokkos::View<Pore*, Mem> pores("pores", max_pores);
   Kokkos::View<int, Mem> counter("counter");
-  { auto hm = Kokkos::create_mirror_view(sdf);
-    for (std::size_t i = 0; i < n; ++i) hm(i) = sdf_h[i];
-    Kokkos::deep_copy(sdf, hm); }
+  uploadVec(sdf_h, sdf);
   Kokkos::deep_copy(counter, 0);
 
   Exec space;
@@ -88,11 +109,7 @@ inline std::vector<Pore> extract_pores_k(const std::vector<float>& sdf_h, std::a
 
   int h_count = 0; { auto hc = Kokkos::create_mirror_view(counter); Kokkos::deep_copy(hc, counter); h_count = hc(); }
   if (h_count > max_pores) h_count = max_pores;
-  std::vector<Pore> out(h_count);
-  { auto hp = Kokkos::create_mirror_view(pores);
-    Kokkos::deep_copy(hp, pores);
-    for (int i = 0; i < h_count; ++i) out[i] = hp(i); }
-  return out;
+  return downloadN(pores, static_cast<std::size_t>(h_count));
 }
 
 // ---- marker-controlled watershed segmentation of the solid + gradient-path pore basins ----
@@ -107,9 +124,7 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h, std::a
   Kokkos::View<float*, Mem> sdf("sdf", n);
   Kokkos::View<int*, Mem> labels("labels", n), roots("roots", n);
   Kokkos::View<int, Mem> changed("changed");
-  { auto hm = Kokkos::create_mirror_view(sdf);
-    for (std::size_t i = 0; i < n; ++i) hm(i) = sdf_h[i];
-    Kokkos::deep_copy(sdf, hm); }
+  uploadVec(sdf_h, sdf);
 
   Exec space;
   using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
@@ -205,10 +220,8 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h, std::a
   });
   space.fence();
 
-  std::vector<int> solid_seg(n), pore_roots(n);
-  { auto hl = Kokkos::create_mirror_view(labels); Kokkos::deep_copy(hl, labels);
-    auto hr = Kokkos::create_mirror_view(roots); Kokkos::deep_copy(hr, roots);
-    for (std::size_t i = 0; i < n; ++i) { solid_seg[i] = hl(i); pore_roots[i] = hr(i); } }
+  std::vector<int> solid_seg = downloadN(labels, n);
+  std::vector<int> pore_roots = downloadN(roots, n);
 
   // 5. combine + renumber on host (pores >0, solids <0, debris 0) -- matches the CUDA host pass
   std::vector<int> seg(n);
@@ -237,9 +250,7 @@ inline std::vector<std::pair<int, int>> extract_topology_k(const std::vector<int
   Kokkos::View<int*, Mem> seg("seg", n);
   Kokkos::View<int*, Mem> pairs("pairs", (std::size_t)max_pairs * 2);  // flattened (l1,l2) interleaved
   Kokkos::View<int, Mem> cnt("cnt");
-  { auto hm = Kokkos::create_mirror_view(seg);
-    for (std::size_t i = 0; i < n; ++i) hm(i) = seg_h[i];
-    Kokkos::deep_copy(seg, hm); }
+  uploadVec(seg_h, seg);
   Kokkos::deep_copy(cnt, 0);
 
   Exec space;
@@ -263,9 +274,9 @@ inline std::vector<std::pair<int, int>> extract_topology_k(const std::vector<int
 
   int h_count = 0; { auto hc = Kokkos::create_mirror_view(cnt); Kokkos::deep_copy(hc, cnt); h_count = hc(); }
   if (h_count > max_pairs) h_count = max_pairs;
+  std::vector<int> flat = downloadN(pairs, static_cast<std::size_t>(2 * h_count));  // only the used slots
   std::vector<std::pair<int, int>> result; result.reserve(h_count);
-  { auto hp = Kokkos::create_mirror_view(pairs); Kokkos::deep_copy(hp, pairs);
-    for (int i = 0; i < h_count; ++i) result.push_back({hp(2 * i), hp(2 * i + 1)}); }
+  for (int i = 0; i < h_count; ++i) result.push_back({flat[2 * i], flat[2 * i + 1]});
   std::sort(result.begin(), result.end());
   result.erase(std::unique(result.begin(), result.end()), result.end());
   return result;
