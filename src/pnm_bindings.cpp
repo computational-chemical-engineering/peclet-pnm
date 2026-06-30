@@ -8,6 +8,7 @@
 /// directly via the shared bridge (tpx::python, transport-core).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/pair.h>  // std::pair conversion (topology connections)
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -84,4 +85,17 @@ NB_MODULE(pnm, m) {
           std::array<int, 3> res{shape_zyx[2], shape_zyx[1], shape_zyx[0]};
           return pnm::extract_topology_k(segmentation, res);
         }, nb::arg("segmentation"), nb::arg("shape"));
+
+  // Fused pipeline (F1): SDF uploaded once, segmentation device-resident across all three stages.
+  m.def("extract_pore_network",
+        [](nb::ndarray<float, nb::c_contig> sdf, std::vector<double> origin_zyx,
+           std::vector<double> spacing_zyx) {
+          std::array<int, 3> res; auto v = to_sdf(sdf, res);
+          std::array<float, 3> org{(float)origin_zyx[2], (float)origin_zyx[1], (float)origin_zyx[0]};
+          std::array<float, 3> spc{(float)spacing_zyx[2], (float)spacing_zyx[1], (float)spacing_zyx[0]};
+          pnm::PoreNetwork net = pnm::extract_pore_network_k(v, res, org, spc);
+          return nb::make_tuple(net.pores, net.seg, net.connections);
+        }, nb::arg("sdf"), nb::arg("origin_zyx"), nb::arg("spacing_zyx"),
+        "Fused extraction (SDF uploaded once, segmentation device-resident across stages): returns "
+        "(pores, segmentation_flat, connections).");
 }
