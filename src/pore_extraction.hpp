@@ -220,24 +220,62 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h, std::a
   });
   space.fence();
 
-  std::vector<int> solid_seg = downloadN(labels, n);
-  std::vector<int> pore_roots = downloadN(roots, n);
-
-  // 5. combine + renumber on host (pores >0, solids <0, debris 0) -- matches the CUDA host pass
-  std::vector<int> seg(n);
-  std::map<int, int> lmap; int next_pore = 1, next_solid = -1;
-  for (std::size_t i = 0; i < n; ++i) {
-    if (sdf_h[i] > 0) {
-      const int r = pore_roots[i];
-      if (lmap.find(r) == lmap.end()) lmap[r] = next_pore++;
-      seg[i] = lmap[r];
-    } else {
-      const int l = solid_seg[i];
-      if (l == -1) seg[i] = 0;
-      else { if (lmap.find(l) == lmap.end()) lmap[l] = next_solid--; seg[i] = lmap[l]; }
-    }
-  }
-  return seg;
+  // 5. combine + renumber ON DEVICE (pores >0 ascending, solids <0 descending, debris 0), matching the
+  // host first-encounter relabel exactly (F2). A label's id is its rank in voxel-index order of first
+  // appearance — which equals the exclusive prefix sum of a "first-occurrence" flag, so it parallelises
+  // without the host std::map + the two full-volume D2Hs (labels/roots stay on device). The root/label
+  // values ARE voxel indices, so per-label scratch is size-n arrays indexed by that value.
+  Kokkos::View<int*, Mem> seg("seg", n);
+  Kokkos::View<int*, Mem> minPoreIdx("minPoreIdx", n), minSolidIdx("minSolidIdx", n);
+  Kokkos::View<int*, Mem> poreFirst("poreFirst", n), solidFirst("solidFirst", n);
+  Kokkos::View<int*, Mem> poreRank("poreRank", n), solidRank("solidRank", n);
+  Kokkos::View<int*, Mem> poreId("poreId", n), solidId("solidId", n);
+  constexpr int kBig = 0x7fffffff;
+  Kokkos::deep_copy(minPoreIdx, kBig);
+  Kokkos::deep_copy(minSolidIdx, kBig);
+  const std::size_t nn = n;
+  using R1 = Kokkos::RangePolicy<Exec>;
+  // (a) per-root/label min voxel index of first appearance (pores use `roots`, solids use `labels`).
+  Kokkos::parallel_for("pnm::relabel_min", R1(space, 0, nn), KOKKOS_LAMBDA(std::size_t i) {
+    if (sdf(i) > 0.0f)
+      Kokkos::atomic_min(&minPoreIdx(roots(i)), static_cast<int>(i));
+    else if (labels(i) != -1)
+      Kokkos::atomic_min(&minSolidIdx(labels(i)), static_cast<int>(i));
+  });
+  space.fence();
+  // (b) flag the voxel that is the first appearance of its label.
+  Kokkos::parallel_for("pnm::relabel_first", R1(space, 0, nn), KOKKOS_LAMBDA(std::size_t i) {
+    poreFirst(i) = (sdf(i) > 0.0f && minPoreIdx(roots(i)) == static_cast<int>(i)) ? 1 : 0;
+    solidFirst(i) =
+        (sdf(i) <= 0.0f && labels(i) != -1 && minSolidIdx(labels(i)) == static_cast<int>(i)) ? 1 : 0;
+  });
+  space.fence();
+  // (c) exclusive prefix sums ⇒ the 0-based rank (= first-encounter order) of each first voxel.
+  Kokkos::parallel_scan("pnm::relabel_porescan", R1(space, 0, nn),
+                        KOKKOS_LAMBDA(std::size_t i, int& upd, const bool fin) {
+                          const int v = poreFirst(i);
+                          if (fin) poreRank(i) = upd;
+                          upd += v;
+                        });
+  Kokkos::parallel_scan("pnm::relabel_solidscan", R1(space, 0, nn),
+                        KOKKOS_LAMBDA(std::size_t i, int& upd, const bool fin) {
+                          const int v = solidFirst(i);
+                          if (fin) solidRank(i) = upd;
+                          upd += v;
+                        });
+  space.fence();
+  // (d) assign each label its signed id at its first voxel (pores 1,2,…; solids −1,−2,…).
+  Kokkos::parallel_for("pnm::relabel_assign", R1(space, 0, nn), KOKKOS_LAMBDA(std::size_t i) {
+    if (poreFirst(i)) poreId(roots(i)) = poreRank(i) + 1;
+    if (solidFirst(i)) solidId(labels(i)) = -(solidRank(i) + 1);
+  });
+  space.fence();
+  // (e) scatter ids to every voxel: pore→poreId, labelled solid→solidId, unlabelled solid (debris)→0.
+  Kokkos::parallel_for("pnm::relabel_seg", R1(space, 0, nn), KOKKOS_LAMBDA(std::size_t i) {
+    seg(i) = (sdf(i) > 0.0f) ? poreId(roots(i)) : (labels(i) == -1 ? 0 : solidId(labels(i)));
+  });
+  space.fence();
+  return downloadN(seg, n);
 }
 
 // ---- boundary-pair topology (unique adjacent-label pairs across +x/+y/+z faces) ----
