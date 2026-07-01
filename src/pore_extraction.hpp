@@ -59,7 +59,7 @@ KOKKOS_INLINE_FUNCTION int get_idx(int x, int y, int z, I3 res) {
 
 // ---- pore detection (local maxima of the SDF + weight-centroid sub-voxel position) ----
 // Device core: operates on an already-uploaded device SDF, so a fused pipeline uploads the SDF once.
-inline std::vector<Pore> extractPoresDevice(const Kokkos::View<float*, Mem>& sdf,
+inline std::vector<Pore> extractPoresView(const Kokkos::View<float*, Mem>& sdf,
                                             std::array<int, 3> resolution, std::array<float, 3> origin,
                                             std::array<float, 3> spacing) {
   const I3 res{resolution[0], resolution[1], resolution[2]};
@@ -117,12 +117,12 @@ inline std::vector<Pore> extract_pores_k(const std::vector<float>& sdf_h, std::a
   if (sdf_h.empty()) return {};
   Kokkos::View<float*, Mem> sdf("sdf", sdf_h.size());
   uploadVec(sdf_h, sdf);
-  return extractPoresDevice(sdf, resolution, origin, spacing);
+  return extractPoresView(sdf, resolution, origin, spacing);
 }
 
 // ---- marker-controlled watershed segmentation of the solid + gradient-path pore basins ----
 // Device core: takes an uploaded device SDF, returns the (device-resident) segmentation View.
-inline Kokkos::View<int*, Mem> segmentVolumeDevice(const Kokkos::View<float*, Mem>& sdf,
+inline Kokkos::View<int*, Mem> segmentVolumeView(const Kokkos::View<float*, Mem>& sdf,
                                                    std::array<int, 3> resolution,
                                                    std::array<float, 3> spacing) {
   const I3 res{resolution[0], resolution[1], resolution[2]};
@@ -291,12 +291,12 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h, std::a
   if (sdf_h.empty()) return {};
   Kokkos::View<float*, Mem> sdf("sdf", sdf_h.size());
   uploadVec(sdf_h, sdf);
-  return downloadN(segmentVolumeDevice(sdf, resolution, spacing), sdf_h.size());
+  return downloadN(segmentVolumeView(sdf, resolution, spacing), sdf_h.size());
 }
 
 // ---- boundary-pair topology (unique adjacent-label pairs across +x/+y/+z faces) ----
 // Device core: takes the (device-resident) segmentation View directly — no re-upload.
-inline std::vector<std::pair<int, int>> extractTopologyDevice(const Kokkos::View<int*, Mem>& seg,
+inline std::vector<std::pair<int, int>> extractTopologyView(const Kokkos::View<int*, Mem>& seg,
                                                               std::array<int, 3> resolution) {
   const I3 res{resolution[0], resolution[1], resolution[2]};
   const std::size_t n = seg.extent(0);
@@ -341,7 +341,7 @@ inline std::vector<std::pair<int, int>> extract_topology_k(const std::vector<int
   if (seg_h.empty()) return {};
   Kokkos::View<int*, Mem> seg("seg", seg_h.size());
   uploadVec(seg_h, seg);
-  return extractTopologyDevice(seg, resolution);
+  return extractTopologyView(seg, resolution);
 }
 
 /// The full pore network from one extraction: pores, the per-voxel segmentation (flat), and the
@@ -363,9 +363,9 @@ inline PoreNetwork extract_pore_network_k(const std::vector<float>& sdf_h,
   if (sdf_h.empty()) return out;
   Kokkos::View<float*, Mem> sdf("sdf", sdf_h.size());
   uploadVec(sdf_h, sdf);
-  out.pores = extractPoresDevice(sdf, resolution, origin, spacing);
-  Kokkos::View<int*, Mem> seg = segmentVolumeDevice(sdf, resolution, spacing);  // stays on device
-  out.connections = extractTopologyDevice(seg, resolution);
+  out.pores = extractPoresView(sdf, resolution, origin, spacing);
+  Kokkos::View<int*, Mem> seg = segmentVolumeView(sdf, resolution, spacing);  // stays on device
+  out.connections = extractTopologyView(seg, resolution);
   out.seg = downloadN(seg, sdf_h.size());
   return out;
 }
