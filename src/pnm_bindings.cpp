@@ -5,7 +5,7 @@
 /// (SDFReader) is pure C++ (sdf_reader.cpp, backend-free); the pore/segmentation/topology compute is
 /// the Kokkos GPU port. Exposes `SDFReader`, `extract_pores`, `segment_volume`, `extract_topology_gpu`.
 /// A C-order (Nz,Ny,Nx) buffer is contiguous x-fastest, so it maps onto the solver's flat layout
-/// directly via the shared bridge (tpx::python, transport-core).
+/// directly via the shared bridge (peclet::core::python, transport-core).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/pair.h>  // std::pair conversion (topology connections)
@@ -19,7 +19,7 @@
 
 #include "pore_extraction.hpp"
 #include "sdf_reader.h"
-#include "tpx/python/ndarray_interop.hpp"
+#include "peclet/core/python/ndarray_interop.hpp"
 
 namespace nb = nanobind;
 using pnm::Pore;
@@ -28,7 +28,7 @@ using pnm::Pore;
 static std::vector<float> to_sdf(nb::ndarray<float, nb::c_contig> a, std::array<int, 3>& res) {
   if (a.ndim() != 3) throw std::runtime_error("SDF array must be 3D (Nz,Ny,Nx)");
   res = {(int)a.shape(2), (int)a.shape(1), (int)a.shape(0)};
-  return tpx::python::ndarray_to_vector<float>(nb::ndarray<>(a));
+  return peclet::core::python::ndarray_to_vector<float>(nb::ndarray<>(a));
 }
 
 NB_MODULE(_pnm, m) {
@@ -36,7 +36,7 @@ NB_MODULE(_pnm, m) {
   if (!Kokkos::is_initialized()) Kokkos::initialize();
   // atexit Kokkos::finalize is REQUIRED on CUDA (else cudaErrorCudartUnloading at exit when Kokkos's
   // device state outlives the CUDA runtime). pnm returns host-vector-backed arrays, so finalize is
-  // always clean here. See sdflow_bindings.cpp.
+  // always clean here. See flow_bindings.cpp.
   nb::module_::import_("atexit").attr("register")(nb::cpp_function([]() {
     if (Kokkos::is_initialized() && !Kokkos::is_finalized()) Kokkos::finalize();
   }));

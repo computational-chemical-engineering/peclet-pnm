@@ -7,8 +7,8 @@
 /// Kokkos::parallel_for, atomicAdd/atomicMin -> Kokkos::atomic_*, cudaMalloc/Memcpy -> Kokkos::View +
 /// deep_copy. The thrust includes in the .cu were dead (sort/unique is host std::sort). Host orchestration
 /// (label renumber via std::map, topology sort/unique) stays on the host. Runs on any Kokkos backend.
-#ifndef CFD_PORE_EXTRACTION_HPP
-#define CFD_PORE_EXTRACTION_HPP
+#ifndef PECLET_FLOW_PORE_EXTRACTION_HPP
+#define PECLET_FLOW_PORE_EXTRACTION_HPP
 
 #include <Kokkos_Core.hpp>
 
@@ -372,4 +372,4 @@ inline PoreNetwork extract_pore_network_k(const std::vector<float>& sdf_h,
 
 }  // namespace pnm
 
-#endif  // CFD_PORE_EXTRACTION_HPP
+#endif  // PECLET_FLOW_PORE_EXTRACTION_HPP
