@@ -31,7 +31,7 @@ static std::vector<float> to_sdf(nb::ndarray<float, nb::c_contig> a, std::array<
   return tpx::python::ndarray_to_vector<float>(nb::ndarray<>(a));
 }
 
-NB_MODULE(pnm, m) {
+NB_MODULE(_pnm, m) {
   m.attr("__doc__") = "pnm — pore-network extraction from SDF geometry (Kokkos)";
   if (!Kokkos::is_initialized()) Kokkos::initialize();
   // atexit Kokkos::finalize is REQUIRED on CUDA (else cudaErrorCudartUnloading at exit when Kokkos's

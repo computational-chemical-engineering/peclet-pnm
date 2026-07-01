@@ -7,7 +7,7 @@ import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../build')))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../cfd_utils')))
-import pnm
+from peclet.flow import pnm
 from vti import save_vti
 
 def verify_segmentation(input_file, output_file, edge_file):
