@@ -5,7 +5,7 @@
 /// (SDFReader) is pure C++ (sdf_reader.cpp, backend-free); the pore/segmentation/topology compute is
 /// the Kokkos GPU port. Exposes `SDFReader`, `extract_pores`, `segment_volume`, `extract_topology_gpu`.
 /// A C-order (Nz,Ny,Nx) buffer is contiguous x-fastest, so it maps onto the solver's flat layout
-/// directly via the shared bridge (peclet::core::python, transport-core).
+/// directly via the shared bridge (peclet::core::python, core).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/pair.h>  // std::pair conversion (topology connections)

@@ -1,5 +1,5 @@
 /// @file
-/// @brief sdflow — portable (Kokkos) pore-network extraction from an SDF.
+/// @brief flow — portable (Kokkos) pore-network extraction from an SDF.
 ///
 /// Kokkos port of pore_extraction.cu (the pnm_backend module): pore detection (local maxima + weighted
 /// centroid), marker-controlled watershed segmentation of the solid (init markers -> union-find CCL ->
