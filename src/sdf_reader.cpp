@@ -12,8 +12,7 @@
 
 // A simple string helper to find value of an XML attribute
 // e.g. WholeExtent="0 10 0 10 0 10"
-std::string get_attribute_value(const std::string &content,
-                                const std::string &attr_name) {
+std::string get_attribute_value(const std::string &content, const std::string &attr_name) {
   size_t pos = content.find(attr_name + "=\"");
   if (pos == std::string::npos)
     return "";
@@ -108,12 +107,11 @@ SDFData SDFReader::read_vti(const std::string &filename) {
     // Maybe we didn't read enough?
     // If the header is larger than 8KB, we are in trouble.
     // Realistically headers are small.
-    throw std::runtime_error(
-        "Could not find binary data marker '_' in first 8KB");
+    throw std::runtime_error("Could not find binary data marker '_' in first 8KB");
   }
 
   // Seek file to the position of the length (immediately after `_`)
-  file.clear(); // Clear EOF flag if we read past end in buffer
+  file.clear();  // Clear EOF flag if we read past end in buffer
   file.seekg(underscore_pos + 1, std::ios::beg);
 
   // Read length (UInt64)
@@ -133,8 +131,8 @@ SDFData SDFReader::read_vti(const std::string &filename) {
   size_t expected_bytes = data.size() * sizeof(float);
   if (data_bytes != expected_bytes) {
     std::cerr << "Warning: Data length in file (" << data_bytes
-              << ") does not match expected size from resolution ("
-              << expected_bytes << ")." << std::endl;
+              << ") does not match expected size from resolution (" << expected_bytes << ")."
+              << std::endl;
     // Proceeding anyway but this is suspicious.
     // It might be that the file size includes some padding or we misread
     // resolution. Or maybe its compressed (zlib)? User said: "Appended Raw
@@ -146,8 +144,8 @@ SDFData SDFReader::read_vti(const std::string &filename) {
   file.read(reinterpret_cast<char *>(data.sdf_values.data()), data_bytes);
 
   if (file.gcount() != static_cast<std::streamsize>(data_bytes)) {
-    std::cerr << "Warning: Could not read all data. Read " << file.gcount()
-              << " bytes." << std::endl;
+    std::cerr << "Warning: Could not read all data. Read " << file.gcount() << " bytes."
+              << std::endl;
   }
 
   return data;
