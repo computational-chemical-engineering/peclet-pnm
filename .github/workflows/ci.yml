@@ -1,0 +1,74 @@
+name: CI
+
+# Build the Kokkos (OpenMP/Serial) backend from source, then build the peclet.pnm module and run the
+# extraction smoke test on a synthetic sphere-lattice SDF. GPU (CUDA/HIP) backends are not
+# exercisable on free GitHub runners; the portable host build catches the vast majority of
+# regressions (the Kokkos source is backend-agnostic).
+
+on:
+  push:
+    branches: [main, "**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  KOKKOS_TAG: "5.1.1"   # keep in lockstep with ../tools/bootstrap_deps.sh
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libomp-dev python3-dev python3-pip
+          python3 -m pip install --upgrade pip nanobind numpy
+
+      - name: Cache Kokkos install
+        id: kokkos-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/kokkos-install
+          key: kokkos-${{ env.KOKKOS_TAG }}-openmp-${{ runner.os }}
+
+      - name: Build Kokkos (OpenMP + Serial)
+        if: steps.kokkos-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$KOKKOS_TAG" https://github.com/kokkos/kokkos.git /tmp/kokkos
+          cmake -S /tmp/kokkos -B /tmp/kokkos/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20 \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DKokkos_ENABLE_OPENMP=ON -DKokkos_ENABLE_SERIAL=ON \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/kokkos-install"
+          cmake --build /tmp/kokkos/build -j
+          cmake --install /tmp/kokkos/build
+
+      - name: Build the pnm module
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/kokkos-install"
+          cmake --build build -j
+
+      - name: Extraction smoke test (synthetic sphere-lattice SDF)
+        run: |
+          PYTHONPATH=$PWD/build python3 - <<'EOF'
+          import numpy as np
+          import peclet.pnm as pnm
+          print("peclet.pnm on", pnm.execution_space)
+          # 2x2x2 lattice of solid spheres in a periodic-ish box: pores at the interstices.
+          n, R = 32, 10.0
+          z, y, x = np.meshgrid(*(np.arange(n, dtype=np.float32),) * 3, indexing="ij")
+          sdf = np.full((n, n, n), np.inf, dtype=np.float32)
+          for cz in (8, 24):
+              for cy in (8, 24):
+                  for cx in (8, 24):
+                      d = np.sqrt((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2) - R
+                      sdf = np.minimum(sdf, d.astype(np.float32))
+          pores, seg, conns = pnm.extract_pore_network(sdf, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
+          print(f"{len(pores)} pores, {len(set(seg))} segments, {len(conns)} connections")
+          assert len(pores) > 0 and len(conns) > 0
+          # Staged path agrees on the pore count.
+          assert len(pnm.extract_pores(sdf, [0.0] * 3, [1.0] * 3)) == len(pores)
+          EOF

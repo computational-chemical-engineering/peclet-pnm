@@ -3,7 +3,7 @@ import sys
 import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../build')))
-from peclet.flow import pnm
+from peclet import pnm
 
 def test_extraction(filename):
     print(f"Reading {filename}...")

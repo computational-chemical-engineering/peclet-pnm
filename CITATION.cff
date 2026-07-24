@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "peclet-pnm: GPU pore-network extraction from signed-distance-field geometry"
+abstract: >-
+  Pore-network extraction from a signed-distance-field (SDF) description of a porous solid: pore
+  detection (local SDF maxima + weighted centroids), marker-controlled watershed segmentation of the
+  pore space (union-find CCL + flood fill), and pore-to-pore throat topology. Written in Kokkos C++
+  (CUDA/HIP/OpenMP) and exposed to Python via nanobind as peclet.pnm. Part of the peclet suite;
+  split out of peclet-flow (its former peclet.flow.pnm module).
+type: software
+authors:
+  - family-names: Peters
+    given-names: Frank
+    email: e.a.j.f.peters@gmail.com
+    affiliation: "Eindhoven University of Technology"
+version: 0.1.0
+date-released: 2026-07-24
+license: MIT
+repository-code: "https://github.com/computational-chemical-engineering/peclet-pnm"

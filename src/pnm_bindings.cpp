@@ -38,7 +38,7 @@ NB_MODULE(_pnm, m) {
     Kokkos::initialize();
   // atexit Kokkos::finalize is REQUIRED on CUDA (else cudaErrorCudartUnloading at exit when
   // Kokkos's device state outlives the CUDA runtime). pnm returns host-vector-backed arrays, so
-  // finalize is always clean here. See flow_bindings.cpp.
+  // finalize is always clean here. See peclet-flow's flow_bindings.cpp.
   nb::module_::import_("atexit").attr("register")(nb::cpp_function([]() {
     if (Kokkos::is_initialized() && !Kokkos::is_finalized())
       Kokkos::finalize();

@@ -1,0 +1,58 @@
+# Python packaging for the `pnm` pore-network-extraction module (peclet.pnm).
+#
+# `pip install .` builds the Kokkos extension via scikit-build-core and installs it as `peclet.pnm`.
+# The Kokkos prefix is NOT pulled from PyPI (it is GPU-arch / backend specific): point the build at a
+# prefix you bootstrapped once with ../tools/bootstrap_deps.sh by exporting CMAKE_PREFIX_PATH. The
+# backend (Serial / OpenMP / CUDA / HIP) is whatever that prefix was built for — one source, every
+# environment.
+#
+#   # CPU / multicore (OpenMP):
+#   CMAKE_PREFIX_PATH=/path/to/extern/install/host-openmp pip install .
+#
+#   # NVIDIA GPU — put nvcc on PATH first:
+#   CMAKE_PREFIX_PATH=/path/to/extern/install/nvidia-cuda pip install .
+
+[build-system]
+requires = ["scikit-build-core>=0.8", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "peclet-pnm"
+version = "0.1.0"
+description = "peclet.pnm — Kokkos pore-network extraction from SDF geometry (pores, watershed segmentation, throat topology)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Frank Peters", email = "e.a.j.f.peters@gmail.com" }]
+dependencies = ["numpy>=1.20"]
+
+[project.urls]
+Homepage = "https://github.com/computational-chemical-engineering/peclet"
+Documentation = "https://github.com/computational-chemical-engineering/peclet"
+Source = "https://github.com/computational-chemical-engineering/peclet-pnm"
+
+[tool.scikit-build]
+minimum-version = "0.8"
+cmake.version = ">=3.24"
+# The extension + the peclet/pnm package __init__.py are placed by the CMake install() rules
+# (guarded by SKBUILD) into the peclet namespace; disable package auto-discovery so nothing else is added.
+wheel.install-dir = "."
+wheel.packages = []
+sdist.include = ["src", "packaging", "cmake", "CMakeLists.txt", "README.md", "LICENSE"]
+
+# ---------------------------------------------------------------------------
+# Self-contained redistributable CPU wheels (cibuildwheel). PECLET_VENDOR_DEPS=ON makes the build
+# FetchContent-build Kokkos (OpenMP+Serial) + the peclet-core headers, so the wheel needs no prefix
+# and runs multicore on any x86-64 Linux. GPU/HIP stays a source (sdist) / container build.
+# Linux-only: the Kokkos build needs a recent toolchain (manylinux_2_28 = GCC 12+, for C++20).
+# ---------------------------------------------------------------------------
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-*"
+skip = "*-musllinux* *_i686 pp*"
+build-frontend = "build"
+manylinux-x86_64-image = "manylinux_2_28"
+test-command = "python -c \"import numpy, peclet.pnm as p; sdf = -numpy.ones((8,8,8), dtype=numpy.float32); assert hasattr(p, 'extract_pores'); print('peclet.pnm', p.execution_space)\""
+
+[tool.cibuildwheel.environment]
+PECLET_VENDOR_DEPS = "ON"

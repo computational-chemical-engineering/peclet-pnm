@@ -1,0 +1,56 @@
+name: Release
+
+# Build + publish peclet-pnm to PyPI on a version tag: sdist + self-contained OpenMP CPU wheels
+# (FetchContent Kokkos OpenMP+Serial, PECLET_VENDOR_DEPS=ON from [tool.cibuildwheel]).
+# Uses PyPI Trusted Publishing (OIDC): register this workflow as the publisher for `peclet-pnm` on
+# PyPI first — no API token secret needed. (A CUDA wheel variant à la peclet-flow-cu13 can be added
+# later; the CMake rpath hook PECLET_CUDA_RUNTIME_WHEEL is already in place.)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    name: wheels (manylinux_2_28 x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # cibuildwheel reads [tool.cibuildwheel] from pyproject.toml (PECLET_VENDOR_DEPS=ON): each wheel
+      # compiles Kokkos as a subproject, so builds are slow but self-contained.
+      - uses: pypa/cibuildwheel@v2.21
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux
+          path: wheelhouse/*.whl
+
+  publish:
+    needs: [sdist, wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+    permissions:
+      id-token: write   # required for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
