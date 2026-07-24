@@ -22,6 +22,11 @@ endif()
 # dependency (installed to site-packages/nvidia/cu13/lib), not the system. Mirrors peclet-flow.
 option(PECLET_CUDA_RUNTIME_WHEEL "RPATH the module to the nvidia-cuda-runtime wheel's libcudart" OFF)
 
+# Multi-rank: -DPECLET_PNM_MPI=ON links MPI + exposes mpi_rank/mpi_size/mpi_block and
+# extract_pore_network_mpi (the distributed extraction on the core ORB decomposition, bit-exact to
+# single-rank). OFF (default) leaves the single-rank module byte-identical. Mirrors PECLET_FLOW_MPI.
+option(PECLET_PNM_MPI "Build the pnm module with the distributed (MPI) extraction exposed" OFF)
+
 # Dependencies via the vendored PecletDeps helper: an installed Kokkos prefix + sibling checkout for
 # the dev/suite build, or FetchContent-built Kokkos + fetched core headers for a self-contained
 # sdist/wheel (cibuildwheel). See cmake/PecletDeps.cmake.
@@ -48,6 +53,15 @@ target_link_libraries(pnm PRIVATE Kokkos::kokkos)
 # vtables it only later finds referenced. Keep sections on HIP (nvcc/ld is lenient).
 if(Kokkos_ENABLE_HIP)
   target_link_options(pnm PRIVATE -Wl,--no-gc-sections)
+endif()
+
+# Distributed (MPI) extraction: compile the binding TU with the gating flag + link MPI (the core
+# grid halo lives in the header-only TPX_INC). Mirrors flow's PECLET_FLOW_MPI wiring.
+if(PECLET_PNM_MPI)
+  find_package(MPI REQUIRED COMPONENTS CXX)
+  target_compile_definitions(pnm PRIVATE PECLET_PNM_MPI=1)
+  target_link_libraries(pnm PRIVATE MPI::MPI_CXX)
+  message(STATUS "pnm: distributed extraction ENABLED (MPI)")
 endif()
 
 # Redistributable CUDA wheel: point the module at the nvidia-cuda-runtime wheel's libcudart via a

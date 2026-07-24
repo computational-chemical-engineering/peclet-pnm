@@ -227,10 +227,15 @@ inline Kokkos::View<int*, Mem> segmentVolumeView(const Kokkos::View<float*, Mem>
   }
 
   // 3. flood-fill the remaining (shallow) solid voxels (26-connectivity, smallest neighbour label),
-  // to fixpoint
+  // to fixpoint. Jacobi (double-buffered): each sweep reads only the previous sweep's labels, so
+  // the result is DETERMINISTIC — the old in-place sweep could observe same-sweep writes (a device
+  // race) — and sweep-for-sweep identical to the distributed flood (pore_extraction_mpi.hpp),
+  // which is what makes the multi-rank segmentation bit-exact to this single-rank path.
+  Kokkos::View<int*, Mem> labelsN("labelsN", n);
   h_changed = 1;
   while (h_changed) {
     Kokkos::deep_copy(changed, 0);
+    Kokkos::deep_copy(labelsN, labels);
     Kokkos::parallel_for(
         "pnm::flood", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
           const int idx = get_idx(ix, iy, iz, res);
@@ -249,11 +254,12 @@ inline Kokkos::View<int*, Mem> segmentVolumeView(const Kokkos::View<float*, Mem>
                   best = nl;
               }
           if (best != -1) {
-            labels(idx) = best;
+            labelsN(idx) = best;
             changed() = 1;
           }
         });
     space.fence();
+    std::swap(labels, labelsN);
     auto hc = Kokkos::create_mirror_view(changed);
     Kokkos::deep_copy(hc, changed);
     h_changed = hc();

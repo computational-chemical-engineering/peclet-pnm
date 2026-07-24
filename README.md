@@ -53,6 +53,28 @@ SDF sign is negative inside the solid — see the suite's `docs/CONVENTIONS.md`.
 Smoke tests: `python scripts/test_extraction.py <sdf.vti>` and
 `python scripts/verify_segmentation.py <sdf.vti>` (writes a labelled `.vti` + a pore-pair edge list).
 
+## Distributed (MPI) extraction
+
+Built with `-DPECLET_PNM_MPI=ON`, the module also runs the whole pipeline **multi-rank**: the SDF
+is decomposed over ranks by the shared peclet-core ORB (the same deterministic partition flow/dem
+use), every stage runs per-rank on a 1-cell ghost layer (core `GridHalo` exchange), and the result
+is **bit-exact to the single-rank pipeline** — labels are global voxel ids, so the CCL fixpoint,
+the watershed flood (Jacobi), the gradient-path pore basins, and the renumbering are all
+decomposition-independent.
+
+```python
+# mpirun -np 4 python extract.py
+import peclet.pnm as pnm
+origin, shape = pnm.mpi_block(global_shape_zyx)      # this rank's ORB block of the global grid
+local = sdf[origin[0]:origin[0]+shape[0], origin[1]:origin[1]+shape[1], origin[2]:origin[2]+shape[2]]
+pores, seg, conns = pnm.extract_pore_network_mpi(local, global_shape_zyx, origin_zyx, spacing_zyx)
+# pores: the pores whose peak this rank owns; seg: this rank's block; conns: global (identical everywhere)
+```
+
+Validated by `tests/kokkos_mpi` (ctest, np = 1, 2, 4, OpenMP + CUDA): per-voxel segmentation ids,
+the pore set, and the connection list all match the single-rank oracle exactly (pore centroid
+positions to 1e-5·spacing on GPU — FMA contraction noise; radii and everything integer bitwise).
+
 ## License
 
 MIT.

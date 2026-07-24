@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <Kokkos_Core.hpp>
 #include <vector>
 
@@ -21,8 +22,35 @@
 #include "pore_extraction.hpp"
 #include "sdf_reader.h"
 
+#ifdef PECLET_PNM_MPI
+#include <mpi.h>
+
+#include "pore_extraction_mpi.hpp"
+#endif
+
 namespace nb = nanobind;
 using pnm::Pore;
+
+#ifdef PECLET_PNM_MPI
+// Ensure MPI_Init has been called (mirrors the flow/dem idiom); safe to call repeatedly. If WE
+// initialized MPI (no mpi4py in the driver), also finalize it at exit so mpirun sees a clean
+// shutdown; when mpi4py did the init, its own atexit hook finalizes.
+static void ensure_mpi_init() {
+  int inited = 0;
+  MPI_Initialized(&inited);
+  if (!inited) {
+    int argc = 0;
+    char** argv = nullptr;
+    MPI_Init(&argc, &argv);
+    std::atexit([]() {
+      int fin = 0;
+      MPI_Finalized(&fin);
+      if (!fin)
+        MPI_Finalize();
+    });
+  }
+}
+#endif
 
 // C-order (Nz,Ny,Nx) float SDF -> flat x-fastest vector + res = (Nx,Ny,Nz).
 static std::vector<float> to_sdf(nb::ndarray<float, nb::c_contig> a, std::array<int, 3>& res) {
@@ -117,4 +145,65 @@ NB_MODULE(_pnm, m) {
       nb::arg("sdf"), nb::arg("origin_zyx"), nb::arg("spacing_zyx"),
       "Fused extraction (SDF uploaded once, segmentation device-resident across stages): returns "
       "(pores, segmentation_flat, connections).");
+
+#ifdef PECLET_PNM_MPI
+  // Distributed path (built with -DPECLET_PNM_MPI=ON): the SDF is decomposed over ranks by the
+  // shared core ORB (same deterministic partition as flow/dem). Query this rank's block with
+  // mpi_block, pass the LOCAL block's SDF to extract_pore_network_mpi. Bit-exact to single-rank.
+  m.def(
+      "mpi_rank",
+      []() {
+        ensure_mpi_init();
+        int r = 0;
+        MPI_Comm_rank(MPI_COMM_WORLD, &r);
+        return r;
+      },
+      "This rank's index in MPI_COMM_WORLD (MPI_Init is called if needed).");
+  m.def(
+      "mpi_size",
+      []() {
+        ensure_mpi_init();
+        int s = 1;
+        MPI_Comm_size(MPI_COMM_WORLD, &s);
+        return s;
+      },
+      "Number of ranks in MPI_COMM_WORLD (MPI_Init is called if needed).");
+  m.def(
+      "mpi_block",
+      [](std::vector<int> global_shape_zyx) {
+        ensure_mpi_init();
+        std::array<int, 3> gd{global_shape_zyx[2], global_shape_zyx[1], global_shape_zyx[0]};
+        std::array<int, 3> o{}, s{};
+        pnm::mpi_block_of(gd, MPI_COMM_WORLD, o, s);
+        return nb::make_tuple(std::vector<int>{o[2], o[1], o[0]},
+                              std::vector<int>{s[2], s[1], s[0]});
+      },
+      nb::arg("global_shape_zyx"),
+      "This rank's ORB block of the global grid: (origin_zyx, shape_zyx). Slice the global SDF "
+      "with these and pass the local block to extract_pore_network_mpi.");
+  m.def(
+      "extract_pore_network_mpi",
+      [](nb::ndarray<float, nb::c_contig> sdf_local, std::vector<int> global_shape_zyx,
+         std::vector<double> origin_zyx, std::vector<double> spacing_zyx) {
+        ensure_mpi_init();
+        std::array<int, 3> res;
+        auto v = to_sdf(sdf_local, res);
+        std::array<int, 3> gd{global_shape_zyx[2], global_shape_zyx[1], global_shape_zyx[0]};
+        std::array<int, 3> bo{}, bs{};
+        pnm::mpi_block_of(gd, MPI_COMM_WORLD, bo, bs);
+        if (res != bs)
+          throw std::runtime_error("sdf_local shape does not match this rank's mpi_block");
+        std::array<float, 3> org{(float)origin_zyx[2], (float)origin_zyx[1], (float)origin_zyx[0]};
+        std::array<float, 3> spc{(float)spacing_zyx[2], (float)spacing_zyx[1],
+                                 (float)spacing_zyx[0]};
+        auto net = pnm::extract_pore_network_mpi(v, gd, org, spc, MPI_COMM_WORLD);
+        return nb::make_tuple(net.pores, net.seg, net.connections);
+      },
+      nb::arg("sdf_local"), nb::arg("global_shape_zyx"), nb::arg("origin_zyx"),
+      nb::arg("spacing_zyx"),
+      "Distributed fused extraction (collective over MPI_COMM_WORLD). sdf_local is this rank's "
+      "ORB block (Nz,Ny,Nx C-order, from mpi_block). Returns (pores_owned_by_this_rank, "
+      "segmentation_flat_local_block, connections_global). Bit-exact to the single-rank "
+      "extract_pore_network on the gathered grid.");
+#endif
 }
