@@ -18,6 +18,17 @@ is pure C++. Part of the peclet suite (see `../CLAUDE.md` and `../docs/` for sui
   `segment_volume`, `extract_topology_gpu`, and the fused `extract_pore_network` (SDF uploaded once,
   segmentation device-resident across stages). Uses core's zero-copy View↔ndarray bridge.
 - `sdf_reader.{h,cpp}` — pure-C++ VTI (VTK ImageData) reader, backend-free.
+- `pore_extraction.hpp` also holds **`extract_network_flow_k`** (binding `extract_network_flow`):
+  throat flow rates + pore-center pressures from a peclet.flow MAC field — the method from the
+  Voronoi PNM (`~/Codes/pnm_voronoi`). KEY FACTS: flow's `u(i,j,k)` is the **-x face** of cell
+  (i,j,k) and the conserved flux is `ox·u·A` (openness-weighted; `cutcell_pressure=True`
+  REQUIRED or all openness is 0); fluxes accumulate on **flow basins** (gradient ascent from
+  EVERY cell — seg-keyed accumulation lets near-wall staircase flux bypass throats, measured 6%);
+  throat dp uses a throat-anchored two-leg min-image (single min-image is ambiguous at L/2);
+  per-pore residual ~ solver tolerance is the built-in correctness check. Validated:
+  `scripts/verify_network_flow.py` (|Q|=F to 1e-11 on tube networks, g>0, Kirchhoff exact).
+  On loose packings per-throat g=Q/dp scatters (intra-pore viscous variation ~ throat drops —
+  real physics, not a bug; the p field's grid-scale roughness μ∇²u·h ≈ 20× the macro gradient).
 - `pore_extraction_mpi.hpp` — the **distributed** pipeline (gated `PECLET_PNM_MPI`): core ORB
   decomposition + g=1 `GridHalo` exchange; labels are GLOBAL voxel ids so every fixpoint is
   decomposition-independent → **bit-exact to single-rank**. Stage design: local union-find CCL +

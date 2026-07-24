@@ -152,9 +152,12 @@ inline std::vector<Pore> extract_pores_k(const std::vector<float>& sdf_h,
 
 // ---- marker-controlled watershed segmentation of the solid + gradient-path pore basins ----
 // Device core: takes an uploaded device SDF, returns the (device-resident) segmentation View.
+// `rootsOut` (optional) receives the gradient-path pore roots (roots(i)==i at the pore peaks) —
+// the network-flow extraction uses them to locate pore centers per label.
 inline Kokkos::View<int*, Mem> segmentVolumeView(const Kokkos::View<float*, Mem>& sdf,
                                                  std::array<int, 3> resolution,
-                                                 std::array<float, 3> spacing) {
+                                                 std::array<float, 3> spacing,
+                                                 Kokkos::View<int*, Mem>* rootsOut = nullptr) {
   const I3 res{resolution[0], resolution[1], resolution[2]};
   const std::size_t n = sdf.extent(0);
   const float min_sp = std::min(spacing[0], std::min(spacing[1], spacing[2]));
@@ -377,6 +380,8 @@ inline Kokkos::View<int*, Mem> segmentVolumeView(const Kokkos::View<float*, Mem>
         seg(i) = (sdf(i) > 0.0f) ? poreId(roots(i)) : (labels(i) == -1 ? 0 : solidId(labels(i)));
       });
   space.fence();
+  if (rootsOut)
+    *rootsOut = roots;
   return seg;  // device-resident; the fused pipeline feeds it straight to the topology stage
 }
 
@@ -453,6 +458,354 @@ inline std::vector<std::pair<int, int>> extract_topology_k(const std::vector<int
   Kokkos::View<int*, Mem> seg("seg", seg_h.size());
   uploadVec(seg_h, seg);
   return extractTopologyView(seg, resolution);
+}
+
+// ---- network flow: throat flow rates + pore-center pressures from a MAC flow field ----
+// The method transferred from the Voronoi PNM (pnm_voronoi/pnm_voro): there, the throat flow was
+// the integral of u·n over the Voronoi facet (facet sliced against the grid, MAC velocities
+// interpolated) and the pore pressure a trilinear interpolation of the cell-centered periodic p
+// at the pore center (Voronoi vertex), with the macroscopic gradient added along the min-image
+// pore-to-pore vector. On the segmentation network both transfer EXACTLY and more simply:
+//   * a throat (label pair) is a set of grid-aligned voxel faces, and on flow's staggered MAC
+//     grid the openness-weighted face velocity IS the discrete flux carrier (div = sum of
+//     o·u·A over the cell faces) — so Q_ij = sum over interface faces of o·u·A, no slicing or
+//     interpolation, and the per-pore signed boundary sum reproduces the solver's divergence
+//     (~0 to solve tolerance) — reported as `pore_residual`, the built-in correctness check.
+//   * the pore center is the basin's SDF peak (the gradient-path root) with the same sub-voxel
+//     centroid refinement as extract_pores; p is trilinearly interpolated there (periodic).
+// Conventions (flow's MAC layout): u(i,j,k) lives on the -x face of cell (i,j,k); ox is that
+// face's openness (fluid area fraction); cell centers sit at origin + i*spacing (pnm convention).
+// CAVEAT: throats are keyed by label PAIR — two disjoint interfaces between the same two pores
+// (e.g. once directly and once through the periodic wrap) merge into one entry and their fluxes
+// add (possibly cancelling). The Voronoi network kept such parallel throats separate.
+struct NetworkFlow {
+  std::vector<Pore> pores;                   // ordered by pore label id (pores[k] <-> label k+1)
+  std::vector<double> pore_pressure;         // periodic-part p at the pore center (trilinear)
+  std::vector<double> pore_residual;         // net signed outflow over the pore's WHOLE boundary
+  std::vector<std::pair<int, int>> throats;  // pore-pore label pairs (li < lj)
+  std::vector<double> throat_flow;           // Q through the interface, positive li -> lj
+  std::vector<double> throat_area;           // open area of the interface (sum o·A over faces)
+  std::vector<double> throat_dp;             // total-pressure drop P_i - P_j =
+                                             //   (p_i - p_j) - grad_p · minimage(x_j - x_i)
+};
+
+inline NetworkFlow extract_network_flow_k(
+    const std::vector<float>& sdf_h, std::array<int, 3> resolution, std::array<float, 3> origin,
+    std::array<float, 3> spacing, const std::vector<double>& u_h, const std::vector<double>& v_h,
+    const std::vector<double>& w_h, const std::vector<double>& p_h,
+    const std::vector<double>& ox_h, const std::vector<double>& oy_h,
+    const std::vector<double>& oz_h,  // pass empty vectors for a fully-open (non-cut-cell) grid
+    std::array<double, 3> grad_p) {
+  NetworkFlow out;
+  if (sdf_h.empty())
+    return out;
+  const I3 res{resolution[0], resolution[1], resolution[2]};
+  const std::size_t n = sdf_h.size();
+  Exec space;
+  using R1 = Kokkos::RangePolicy<Exec>;
+
+  Kokkos::View<float*, Mem> sdf("nf::sdf", n);
+  uploadVec(sdf_h, sdf);
+  Kokkos::View<int*, Mem> roots;
+  Kokkos::View<int*, Mem> seg = segmentVolumeView(sdf, resolution, spacing, &roots);
+
+  // number of pore labels
+  int np = 0;
+  Kokkos::parallel_reduce(
+      "nf::np", R1(space, 0, n),
+      KOKKOS_LAMBDA(std::size_t i, int& m) {
+        if (seg(i) > m)
+          m = seg(i);
+      },
+      Kokkos::Max<int>(np));
+  space.fence();
+  if (np == 0)
+    return out;
+
+  // pore centers: the basin peak (gradient-path root) per label + centroid refinement
+  Kokkos::View<int*, Mem> peak("nf::peak", np);
+  Kokkos::parallel_for(
+      "nf::peaks", R1(space, 0, n), KOKKOS_LAMBDA(std::size_t i) {
+        if (sdf(i) > 0.0f && roots(i) == static_cast<int>(i))
+          peak(seg(i) - 1) = static_cast<int>(i);
+      });
+  space.fence();
+  Kokkos::View<Pore*, Mem> poresD("nf::pores", np);
+  {
+    const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
+    const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
+    const I3 r = res;
+    Kokkos::parallel_for(
+        "nf::centers", R1(space, 0, np), KOKKOS_LAMBDA(int k) {
+          const int ci = peak(k);
+          const int ix = ci % r.x, iy = (ci / r.x) % r.y, iz = ci / (r.x * r.y);
+          float sw = 0.0f, px = 0.0f, py = 0.0f, pz = 0.0f;
+          for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+              for (int dx = -1; dx <= 1; ++dx) {
+                const float v = sdf(get_idx(ix + dx, iy + dy, iz + dz, r));
+                float w = v > 0.0f ? v : 0.0f;
+                w = w * w;
+                sw += w;
+                px += dx * w;
+                py += dy * w;
+                pz += dz * w;
+              }
+          float fx = 0, fy = 0, fz = 0;
+          if (sw > 1e-6f) {
+            fx = px / sw;
+            fy = py / sw;
+            fz = pz / sw;
+          }
+          poresD(k) = Pore{oxo + (ix + fx) * sx, oyo + (iy + fy) * sy, ozo + (iz + fz) * sz,
+                           sdf(ci)};
+        });
+    space.fence();
+  }
+  out.pores = downloadN(poresD, static_cast<std::size_t>(np));
+
+  // fields on device
+  auto upl = [&](const std::vector<double>& h, const char* nm, bool required) {
+    Kokkos::View<double*, Mem> d(nm, required || !h.empty() ? n : 0);
+    if (!h.empty())
+      uploadVec(h, d);
+    return d;
+  };
+  Kokkos::View<double*, Mem> u = upl(u_h, "nf::u", true), v = upl(v_h, "nf::v", true),
+                             w = upl(w_h, "nf::w", true), p = upl(p_h, "nf::p", true);
+  const bool hasOpen = !ox_h.empty();
+  Kokkos::View<double*, Mem> ox = upl(ox_h, "nf::ox", false), oy = upl(oy_h, "nf::oy", false),
+                             oz = upl(oz_h, "nf::oz", false);
+
+  // pore-center pressures: trilinear interpolation of the cell-centered periodic p
+  Kokkos::View<double*, Mem> ppres("nf::ppres", np);
+  {
+    const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
+    const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
+    const I3 r = res;
+    Kokkos::parallel_for(
+        "nf::pore_pressure", R1(space, 0, np), KOKKOS_LAMBDA(int k) {
+          const Pore po = poresD(k);
+          const double g[3] = {(po.x - oxo) / sx, (po.y - oyo) / sy, (po.z - ozo) / sz};
+          int b[3];
+          double f[3];
+          for (int a = 0; a < 3; ++a) {
+            const double fl = Kokkos::floor(g[a]);
+            b[a] = static_cast<int>(fl);
+            f[a] = g[a] - fl;
+          }
+          double acc = 0.0;
+          for (int dz = 0; dz < 2; ++dz)
+            for (int dy = 0; dy < 2; ++dy)
+              for (int dx = 0; dx < 2; ++dx) {
+                const double wt = (dx ? f[0] : 1.0 - f[0]) * (dy ? f[1] : 1.0 - f[1]) *
+                                  (dz ? f[2] : 1.0 - f[2]);
+                acc += wt * p(get_idx(b[0] + dx, b[1] + dy, b[2] + dz, r));
+              }
+          ppres(k) = acc;
+        });
+    space.fence();
+  }
+  {
+    auto hv = downloadN(ppres, static_cast<std::size_t>(np));
+    out.pore_pressure.assign(hv.begin(), hv.end());
+  }
+
+  // FLOW-basin labels for every cell: gradient ascent from ALL cells (not just sdf>0). Cut cells
+  // whose CENTER is inside the solid still carry real openness-weighted flux (the near-wall
+  // staircase); keyed on seg alone that flux bypasses the pore-pore interface (measured: 6% of
+  // the tube flux through the wall annulus, exactly the pore residual). Ascent assigns each such
+  // cell to the pore basin whose flow it carries; deep solid ends at a solid peak (negative
+  // label) and carries no flux.
+  Kokkos::View<int*, Mem> flowLab("nf::flowLab", n);
+  {
+    const I3 r = res;
+    Kokkos::parallel_for(
+        "nf::flow_basins", R1(space, 0, n), KOKKOS_LAMBDA(std::size_t i0) {
+          int walker = static_cast<int>(i0);
+          const int MAX_STEPS = 512;
+          for (int s0 = 0; s0 < MAX_STEPS; ++s0) {
+            int best = walker;
+            float bv = sdf(walker);
+            const int wx = walker % r.x, wy = (walker / r.x) % r.y, wz = walker / (r.x * r.y);
+            for (int dz = -1; dz <= 1; ++dz)
+              for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                  if (dx == 0 && dy == 0 && dz == 0)
+                    continue;
+                  const int ni = get_idx(wx + dx, wy + dy, wz + dz, r);
+                  const float nv = sdf(ni);
+                  if (nv > bv) {
+                    bv = nv;
+                    best = ni;
+                  } else if (nv == bv && ni > best)
+                    best = ni;
+                }
+            if (best == walker)
+              break;
+            walker = best;
+          }
+          flowLab(i0) = seg(walker);  // seg at a pore peak == its pore label id
+        });
+    space.fence();
+  }
+
+  // throat list: adjacent flow-basin pairs with OPEN interface faces (o > 0)
+  {
+    const I3 r = res;
+    const bool ho = hasOpen;
+    const std::int64_t maxp = static_cast<std::int64_t>(n) * 3;
+    Kokkos::View<std::int64_t*, Mem> praw("nf::praw", static_cast<std::size_t>(maxp));
+    Kokkos::View<int, Mem> pcnt("nf::pcnt");
+    Kokkos::deep_copy(pcnt, 0);
+    using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
+    Kokkos::parallel_for(
+        "nf::throat_pairs", MD(space, {0, 0, 0}, {r.x, r.y, r.z}),
+        KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
+          const int c = get_idx(ixx, iyy, izz, r);
+          const int a = flowLab(c);
+          for (int d = 0; d < 3; ++d) {
+            const int nb = get_idx(ixx + (d == 0), iyy + (d == 1), izz + (d == 2), r);
+            const int b = flowLab(nb);
+            if (a == b || a <= 0 || b <= 0)
+              continue;
+            const double opn = ho ? (d == 0 ? ox(nb) : (d == 1 ? oy(nb) : oz(nb))) : 1.0;
+            if (opn <= 0.0)
+              continue;
+            const int lo = a < b ? a : b, hi = a < b ? b : a;
+            const int s0 = Kokkos::atomic_fetch_add(&pcnt(), 1);
+            if (s0 < maxp)
+              praw(s0) = (static_cast<std::int64_t>(lo) << 32) | hi;
+          }
+        });
+    space.fence();
+    auto hc = Kokkos::create_mirror_view(pcnt);
+    Kokkos::deep_copy(hc, pcnt);
+    auto keys0 = downloadN(praw, static_cast<std::size_t>(std::min<std::int64_t>(hc(), maxp)));
+    std::sort(keys0.begin(), keys0.end());
+    keys0.erase(std::unique(keys0.begin(), keys0.end()), keys0.end());
+    for (auto k : keys0)
+      out.throats.push_back({static_cast<int>(k >> 32), static_cast<int>(k & 0x7fffffff)});
+  }
+  const std::size_t nt = out.throats.size();
+  std::vector<std::int64_t> keys(nt);
+  for (std::size_t t = 0; t < nt; ++t)
+    keys[t] = (static_cast<std::int64_t>(out.throats[t].first) << 32) | out.throats[t].second;
+  Kokkos::View<std::int64_t*, Mem> keyD("nf::keys", nt);
+  uploadVec(keys, keyD);
+
+  // accumulate: openness-weighted MAC face fluxes over every flow-basin boundary face, plus the
+  // area-weighted throat centroid (min-imaged relative to the lower pore's center).
+  Kokkos::View<double*, Mem> Q("nf::Q", nt), A("nf::A", nt), resid("nf::resid", np);
+  Kokkos::View<double*, Mem> Cx("nf::Cx", nt), Cy("nf::Cy", nt), Cz("nf::Cz", nt);
+  {
+    const double Ax = double(spacing[1]) * spacing[2], Ay = double(spacing[0]) * spacing[2],
+                 Az = double(spacing[0]) * spacing[1];
+    const I3 r = res;
+    const std::int64_t ntl = static_cast<std::int64_t>(nt);
+    const bool ho = hasOpen;
+    const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
+    const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
+    const double Lx = double(r.x) * sx, Ly = double(r.y) * sy, Lz = double(r.z) * sz;
+    auto poresDl = poresD;
+    using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
+    Kokkos::parallel_for(
+        "nf::throat_flux", MD(space, {0, 0, 0}, {r.x, r.y, r.z}),
+        KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
+          const int c = get_idx(ixx, iyy, izz, r);
+          const int a = flowLab(c);
+          for (int d = 0; d < 3; ++d) {
+            const int nb = get_idx(ixx + (d == 0), iyy + (d == 1), izz + (d == 2), r);
+            const int b = flowLab(nb);
+            if (a == b)
+              continue;
+            // the shared face is the -d face of the +d neighbour: velocity/openness live there
+            const double vel = d == 0 ? u(nb) : (d == 1 ? v(nb) : w(nb));
+            const double opn = ho ? (d == 0 ? ox(nb) : (d == 1 ? oy(nb) : oz(nb))) : 1.0;
+            const double area = d == 0 ? Ax : (d == 1 ? Ay : Az);
+            const double q = opn * vel * area;  // positive = flow from c to the +d neighbour
+            if (a > 0)
+              Kokkos::atomic_add(&resid(a - 1), q);
+            if (b > 0)
+              Kokkos::atomic_add(&resid(b - 1), -q);
+            if (a > 0 && b > 0 && opn > 0.0) {
+              const int lo = a < b ? a : b, hi = a < b ? b : a;
+              const std::int64_t key = (static_cast<std::int64_t>(lo) << 32) | hi;
+              // binary search the sorted throat keys
+              std::int64_t l = 0, hgh = ntl - 1, slot = -1;
+              while (l <= hgh) {
+                const std::int64_t mid = l + (hgh - l) / 2;
+                if (keyD(mid) == key) {
+                  slot = mid;
+                  break;
+                }
+                if (keyD(mid) < key)
+                  l = mid + 1;
+                else
+                  hgh = mid - 1;
+              }
+              if (slot >= 0) {
+                const double w0 = opn * area;
+                Kokkos::atomic_add(&Q(slot), a < b ? q : -q);
+                Kokkos::atomic_add(&A(slot), w0);
+                // face center, min-imaged relative to the lower pore's center
+                const Pore plo = poresDl(lo - 1);
+                double fp[3] = {oxo + (ixx + (d == 0 ? 0.5 : 0.0)) * double(sx),
+                                oyo + (iyy + (d == 1 ? 0.5 : 0.0)) * double(sy),
+                                ozo + (izz + (d == 2 ? 0.5 : 0.0)) * double(sz)};
+                const double pc[3] = {double(plo.x), double(plo.y), double(plo.z)};
+                const double Lw[3] = {Lx, Ly, Lz};
+                for (int a2 = 0; a2 < 3; ++a2) {
+                  double dv = fp[a2] - pc[a2];
+                  dv -= Lw[a2] * Kokkos::round(dv / Lw[a2]);
+                  fp[a2] = dv;
+                }
+                Kokkos::atomic_add(&Cx(slot), w0 * fp[0]);
+                Kokkos::atomic_add(&Cy(slot), w0 * fp[1]);
+                Kokkos::atomic_add(&Cz(slot), w0 * fp[2]);
+              }
+            }
+          }
+        });
+    space.fence();
+  }
+  std::vector<double> hcx, hcy, hcz;
+  {
+    auto hq = downloadN(Q, nt);
+    auto ha = downloadN(A, nt);
+    auto hr = downloadN(resid, static_cast<std::size_t>(np));
+    hcx = downloadN(Cx, nt);
+    hcy = downloadN(Cy, nt);
+    hcz = downloadN(Cz, nt);
+    out.throat_flow.assign(hq.begin(), hq.end());
+    out.throat_area.assign(ha.begin(), ha.end());
+    out.pore_residual.assign(hr.begin(), hr.end());
+  }
+
+  // total-pressure drop per throat: periodic parts + the macroscopic gradient along the throat-
+  // anchored two-leg min-image path i -> throat centroid -> j. (The Voronoi original used a
+  // single min-image between the pore centers; anchoring at the throat disambiguates pores at
+  // exactly half the period and follows the physical path of THIS interface.)
+  out.throat_dp.resize(nt);
+  const double L[3] = {double(res.x) * spacing[0], double(res.y) * spacing[1],
+                       double(res.z) * spacing[2]};
+  for (std::size_t t = 0; t < nt; ++t) {
+    const int li = out.throats[t].first, lj = out.throats[t].second;
+    const Pore& pi = out.pores[li - 1];
+    const Pore& pj = out.pores[lj - 1];
+    const double aw = out.throat_area[t];
+    double macro = 0.0;
+    const double ct[3] = {hcx[t] / aw, hcy[t] / aw, hcz[t] / aw};  // throat rel. to pore i
+    const double pip[3] = {double(pi.x), double(pi.y), double(pi.z)};
+    const double pjp[3] = {double(pj.x), double(pj.y), double(pj.z)};
+    for (int a = 0; a < 3; ++a) {
+      double leg2 = pjp[a] - (pip[a] + ct[a]);
+      leg2 -= L[a] * std::round(leg2 / L[a]);  // minimum image of throat -> j
+      macro += grad_p[a] * (ct[a] + leg2);
+    }
+    out.throat_dp[t] = (out.pore_pressure[li - 1] - out.pore_pressure[lj - 1]) - macro;
+  }
+  return out;
 }
 
 /// The full pore network from one extraction: pores, the per-voxel segmentation (flat), and the

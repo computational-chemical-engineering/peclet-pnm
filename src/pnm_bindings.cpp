@@ -8,7 +8,8 @@
 /// solver's flat layout directly via the shared bridge (peclet::core::python, core).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
-#include <nanobind/stl/pair.h>  // std::pair conversion (topology connections)
+#include <nanobind/stl/optional.h>  // optional openness arrays (extract_network_flow)
+#include <nanobind/stl/pair.h>      // std::pair conversion (topology connections)
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -58,6 +59,15 @@ static std::vector<float> to_sdf(nb::ndarray<float, nb::c_contig> a, std::array<
     throw std::runtime_error("SDF array must be 3D (Nz,Ny,Nx)");
   res = {(int)a.shape(2), (int)a.shape(1), (int)a.shape(0)};
   return peclet::core::python::ndarray_to_vector<float>(nb::ndarray<>(a));
+}
+
+// C-order (Nz,Ny,Nx) double field -> flat x-fastest vector, shape-checked against the SDF's res.
+static std::vector<double> to_field(nb::ndarray<double, nb::c_contig> a,
+                                    const std::array<int, 3>& res, const char* name) {
+  if (a.ndim() != 3 || (int)a.shape(2) != res[0] || (int)a.shape(1) != res[1] ||
+      (int)a.shape(0) != res[2])
+    throw std::runtime_error(std::string(name) + " must be (Nz,Ny,Nx) matching the SDF");
+  return peclet::core::python::ndarray_to_vector<double>(nb::ndarray<>(a));
 }
 
 NB_MODULE(_pnm, m) {
@@ -145,6 +155,57 @@ NB_MODULE(_pnm, m) {
       nb::arg("sdf"), nb::arg("origin_zyx"), nb::arg("spacing_zyx"),
       "Fused extraction (SDF uploaded once, segmentation device-resident across stages): returns "
       "(pores, segmentation_flat, connections).");
+
+  // Network flow: throat flow rates + pore-center pressures from a peclet.flow MAC field (the
+  // method transferred from the Voronoi PNM). Pass flow's fields transposed to (Nz,Ny,Nx):
+  // u = s.get_uf().T etc. (zero-copy view of the [x,y,z] Fortran array).
+  m.def(
+      "extract_network_flow",
+      [](nb::ndarray<float, nb::c_contig> sdf, std::vector<double> origin_zyx,
+         std::vector<double> spacing_zyx, nb::ndarray<double, nb::c_contig> u,
+         nb::ndarray<double, nb::c_contig> v, nb::ndarray<double, nb::c_contig> w,
+         nb::ndarray<double, nb::c_contig> p,
+         std::optional<nb::ndarray<double, nb::c_contig>> ox,
+         std::optional<nb::ndarray<double, nb::c_contig>> oy,
+         std::optional<nb::ndarray<double, nb::c_contig>> oz, std::vector<double> grad_p_zyx) {
+        std::array<int, 3> res;
+        auto sv = to_sdf(sdf, res);
+        if ((bool)ox != (bool)oy || (bool)ox != (bool)oz)
+          throw std::runtime_error("pass all three openness arrays (ox,oy,oz) or none");
+        std::array<float, 3> org{(float)origin_zyx[2], (float)origin_zyx[1], (float)origin_zyx[0]};
+        std::array<float, 3> spc{(float)spacing_zyx[2], (float)spacing_zyx[1],
+                                 (float)spacing_zyx[0]};
+        std::array<double, 3> gp{grad_p_zyx[2], grad_p_zyx[1], grad_p_zyx[0]};
+        auto net = pnm::extract_network_flow_k(
+            sv, res, org, spc, to_field(u, res, "u"), to_field(v, res, "v"),
+            to_field(w, res, "w"), to_field(p, res, "p"),
+            ox ? to_field(*ox, res, "ox") : std::vector<double>{},
+            oy ? to_field(*oy, res, "oy") : std::vector<double>{},
+            oz ? to_field(*oz, res, "oz") : std::vector<double>{}, gp);
+        nb::dict d;
+        d["pores"] = net.pores;
+        d["pore_pressure"] = net.pore_pressure;
+        d["pore_residual"] = net.pore_residual;
+        d["throats"] = net.throats;
+        d["throat_flow"] = net.throat_flow;
+        d["throat_area"] = net.throat_area;
+        d["throat_dp"] = net.throat_dp;
+        return d;
+      },
+      nb::arg("sdf"), nb::arg("origin_zyx"), nb::arg("spacing_zyx"), nb::arg("u"), nb::arg("v"),
+      nb::arg("w"), nb::arg("p"), nb::arg("ox") = nb::none(), nb::arg("oy") = nb::none(),
+      nb::arg("oz") = nb::none(), nb::arg("grad_p_zyx") = std::vector<double>{0.0, 0.0, 0.0},
+      "Pore-network FLOW data from a MAC field on the same grid as the SDF: segments the SDF, "
+      "then returns per-pore-label centers/pressures (trilinear p at the basin peak, periodic) "
+      "and per-throat flow rates (sum of openness-weighted MAC face fluxes o*u*A over the "
+      "label-interface faces; positive from the lower to the higher label). All arrays are "
+      "(Nz,Ny,Nx) C-order on the SDF grid: pass flow's fields as get_uf().T, get_p().T, "
+      "get_ox().T, ... u(i,j,k) is the -x face velocity of cell (i,j,k) (flow's MAC layout); "
+      "omit ox/oy/oz for a fully open grid. grad_p_zyx adds the macroscopic gradient along the "
+      "min-image pore-to-pore vector to throat_dp (= P_i - P_j, drives flow i->j when positive). "
+      "pore_residual is the signed flux sum over each pore's whole boundary — ~solver tolerance "
+      "when u is flow's projected divergence-free field. NOTE: throats are keyed by label pair; "
+      "disjoint parallel interfaces between the same two pores merge (fluxes add).");
 
 #ifdef PECLET_PNM_MPI
   // Distributed path (built with -DPECLET_PNM_MPI=ON): the SDF is decomposed over ranks by the

@@ -53,6 +53,43 @@ SDF sign is negative inside the solid — see the suite's `docs/CONVENTIONS.md`.
 Smoke tests: `python scripts/test_extraction.py <sdf.vti>` and
 `python scripts/verify_segmentation.py <sdf.vti>` (writes a labelled `.vti` + a pore-pair edge list).
 
+## Network flow: throat flow rates + pore pressures from a DNS
+
+`extract_network_flow` turns a converged [peclet-flow](https://github.com/computational-chemical-engineering/peclet-flow)
+velocity/pressure field on the same grid into pore-network flow data — the method carried over
+from the Voronoi-tessellation PNM of sphere packings (`pnm_voronoi`), where the throat flow was
+∫u·n over the Voronoi facet and the pore pressure a trilinear sample at the pore center:
+
+```python
+s = peclet.flow.Solver(nx, ny, nz)
+...; s.set_body_force(fx, 0, 0); s.set_solid(sdf_xyz, cutcell_pressure=True); ...steps...
+net = pnm.extract_network_flow(
+    sdf_zyx, origin_zyx, spacing_zyx,
+    s.get_uf().T, s.get_vf().T, s.get_wf().T, s.get_p().T,   # zero-copy transposes to zyx
+    s.get_ox().T, s.get_oy().T, s.get_oz().T,                # cut-cell face openness
+    grad_p_zyx=[0, 0, -fx])                                  # body force f == -grad p_macro
+net["throat_flow"]     # Q through each pore-pore interface (o·u·A summed over MAC faces)
+net["pore_pressure"]   # periodic p interpolated at each pore center (basin SDF peak)
+net["throat_dp"]       # total-pressure drop P_i - P_j (periodic parts + macro gradient
+                       # along the throat-anchored min-image path)
+net["pore_residual"]   # signed flux over each pore's whole boundary — ~ solver tolerance
+```
+
+On the voxel network the throat integral is exact: a throat is a set of grid-aligned MAC faces
+and the openness-weighted face velocity is the discrete flux carrier, so per-pore mass balance
+holds to the pressure-solve tolerance (`pore_residual` is the built-in check). Fluxes are
+accumulated on **flow basins** (gradient-ascent assignment of *every* cell, including cut cells
+whose center is inside the solid) — keyed on the segmentation labels alone, the near-wall
+staircase flux would bypass the interface (measured 6% on a tube).
+
+Validated in `scripts/verify_network_flow.py` (chamber-tube chain + asymmetric tube lattice,
+DNS by peclet.flow): every throat carries the DNS flux to ~1e-11 relative, residuals ~1e-12·F,
+g = Q/dp > 0 on all throats, and the dp sum around each loop equals the macroscopic drop.
+`scripts/demo_network_flow_packing.py` runs the pipeline on a real sphere packing. Caveats: two
+disjoint interfaces between the same two pores merge (pair-keyed throats); on loose packings
+(porosity ≳ 0.6) intra-pore pressure variation is comparable to throat drops, so per-throat
+g = Q/dp scatters — a property of the point-pressure PNM abstraction, not of the extraction.
+
 ## Distributed (MPI) extraction
 
 Built with `-DPECLET_PNM_MPI=ON`, the module also runs the whole pipeline **multi-rank**: the SDF
