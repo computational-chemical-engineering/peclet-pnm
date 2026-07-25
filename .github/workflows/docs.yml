@@ -1,0 +1,59 @@
+name: Documentation
+
+# Build the Doxygen API documentation (Kokkos C++ in src/, Python in scripts/ & tests/) and publish it
+# to GitHub Pages. Requires Pages to be enabled for the repository with "Source: GitHub Actions"
+# (Settings -> Pages). Runs on every push to main; can also be triggered manually. Doxygen only parses
+# the sources (no Kokkos toolchain needed), so this runs on a plain ubuntu runner.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'docs/**'
+      - 'README.md'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# allow one concurrent deployment; cancel an in-progress run for a newer push
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Doxygen + Graphviz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y doxygen graphviz
+
+      - name: Build documentation
+        run: doxygen docs/Doxyfile
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

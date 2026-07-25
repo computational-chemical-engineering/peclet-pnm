@@ -1,0 +1,69 @@
+# Doxygen configuration for peclet.flow. Generates HTML API docs for the Kokkos C++ sources (src/) and the
+# Python driver/verification scripts (scripts/, tests/). Build with:  doxygen docs/Doxyfile
+# Output lands in docs/html/ ; the Documentation CI workflow publishes it to GitHub Pages.
+
+#---- project -------------------------------------------------------------------------------------
+PROJECT_NAME           = "pnm"
+PROJECT_NUMBER         = 0.1.0
+PROJECT_BRIEF          = "peclet.pnm — pore-network extraction from SDF geometry (Kokkos)"
+OUTPUT_DIRECTORY       = docs
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+CREATE_SUBDIRS         = NO
+
+#---- inputs --------------------------------------------------------------------------------------
+INPUT                  = README.md src scripts tests
+USE_MDFILE_AS_MAINPAGE = README.md
+RECURSIVE              = YES
+FILE_PATTERNS          = *.cpp *.cc *.h *.hpp *.py *.md
+EXCLUDE_PATTERNS       = */build*/* */.venv/* */__pycache__/* */conductor/*
+
+#---- extraction ----------------------------------------------------------------------------------
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_LOCAL_CLASSES  = YES
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = YES
+MARKDOWN_SUPPORT       = YES
+OPTIMIZE_OUTPUT_FOR_C  = NO
+PYTHON_DOCSTRING       = YES
+TAB_SIZE               = 2
+DISTRIBUTE_GROUP_DOC   = YES
+
+#---- Kokkos / preprocessor -----------------------------------------------------------------------
+# Strip Kokkos execution-space qualifiers so the C++ parser is not confused by them; the device
+# kernels are ordinary C++ (Kokkos routes them through nvcc/hipcc at build time, never .cu).
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = KOKKOS_INLINE_FUNCTION= \
+                         KOKKOS_FORCEINLINE_FUNCTION= \
+                         KOKKOS_FUNCTION= \
+                         KOKKOS_DEFAULTED_FUNCTION= \
+                         __host__= \
+                         __device__= \
+                         __restrict__=
+
+#---- presentation --------------------------------------------------------------------------------
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+HTML_COLORSTYLE        = LIGHT
+SORT_MEMBER_DOCS       = NO
+
+#---- diagrams (no external dot dependency required) ----------------------------------------------
+HAVE_DOT               = NO
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = NO
+
+#---- warnings (keep CI logs readable) ------------------------------------------------------------
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_NO_PARAMDOC       = NO
+WARN_AS_ERROR          = NO
