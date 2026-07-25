@@ -707,7 +707,11 @@ inline NetworkFlow extract_network_flow_k(
     const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
     const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
     const double Lx = double(r.x) * sx, Ly = double(r.y) * sy, Lz = double(r.z) * sz;
-    auto poresDl = poresD;
+    // Min-image anchor per throat: the LOWER pore's PEAK VOXEL center — integer coordinates, so
+    // the periodic-image branch is deterministic (the refined float centroid wobbles ~1e-8 under
+    // CUDA FMA contraction, which flips the image of faces exactly half a period away —
+    // measured on a symmetric sphere lattice).
+    auto peakl = peak;
     using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
     Kokkos::parallel_for(
         "nf::throat_flux", MD(space, {0, 0, 0}, {r.x, r.y, r.z}),
@@ -748,12 +752,14 @@ inline NetworkFlow extract_network_flow_k(
                 const double w0 = opn * area;
                 Kokkos::atomic_add(&Q(slot), a < b ? q : -q);
                 Kokkos::atomic_add(&A(slot), w0);
-                // face center, min-imaged relative to the lower pore's center
-                const Pore plo = poresDl(lo - 1);
+                // face center, min-imaged relative to the lower pore's peak voxel center
+                const int pk = peakl(lo - 1);
+                const int pkx = pk % r.x, pky = (pk / r.x) % r.y, pkz = pk / (r.x * r.y);
                 double fp[3] = {oxo + (ixx + (d == 0 ? 0.5 : 0.0)) * double(sx),
                                 oyo + (iyy + (d == 1 ? 0.5 : 0.0)) * double(sy),
                                 ozo + (izz + (d == 2 ? 0.5 : 0.0)) * double(sz)};
-                const double pc[3] = {double(plo.x), double(plo.y), double(plo.z)};
+                const double pc[3] = {oxo + pkx * double(sx), oyo + pky * double(sy),
+                                      ozo + pkz * double(sz)};
                 const double Lw[3] = {Lx, Ly, Lz};
                 for (int a2 = 0; a2 < 3; ++a2) {
                   double dv = fp[a2] - pc[a2];
@@ -789,19 +795,34 @@ inline NetworkFlow extract_network_flow_k(
   out.throat_dp.resize(nt);
   const double L[3] = {double(res.x) * spacing[0], double(res.y) * spacing[1],
                        double(res.z) * spacing[2]};
+  const auto peakH = downloadN(peak, static_cast<std::size_t>(np));
   for (std::size_t t = 0; t < nt; ++t) {
     const int li = out.throats[t].first, lj = out.throats[t].second;
     const Pore& pi = out.pores[li - 1];
     const Pore& pj = out.pores[lj - 1];
     const double aw = out.throat_area[t];
+    const int pk = peakH[li - 1];
+    const double anc[3] = {origin[0] + (pk % res.x) * double(spacing[0]),
+                           origin[1] + ((pk / res.x) % res.y) * double(spacing[1]),
+                           origin[2] + (pk / (res.x * res.y)) * double(spacing[2])};
+    const int pkj = peakH[lj - 1];
+    const double ancj[3] = {origin[0] + (pkj % res.x) * double(spacing[0]),
+                            origin[1] + ((pkj / res.x) % res.y) * double(spacing[1]),
+                            origin[2] + (pkj / (res.x * res.y)) * double(spacing[2])};
     double macro = 0.0;
-    const double ct[3] = {hcx[t] / aw, hcy[t] / aw, hcz[t] / aw};  // throat rel. to pore i
     const double pip[3] = {double(pi.x), double(pi.y), double(pi.z)};
     const double pjp[3] = {double(pj.x), double(pj.y), double(pj.z)};
+    const int N[3] = {res.x, res.y, res.z};
     for (int a = 0; a < 3; ++a) {
-      double leg2 = pjp[a] - (pip[a] + ct[a]);
-      leg2 -= L[a] * std::round(leg2 / L[a]);  // minimum image of throat -> j
-      macro += grad_p[a] * (ct[a] + leg2);
+      // Two-leg path i -> throat -> j; every position term cancels except the integer periodic
+      // image count k, which is decided in SNAPPED integer-cell arithmetic (peak-voxel anchors +
+      // the bias-rounded throat centroid) so float wobble (refined centroids ~1e-8, atomic sum
+      // order ~1e-13) can never flip the image branch.
+      const double ct = (hcx[t] * (a == 0) + hcy[t] * (a == 1) + hcz[t] * (a == 2)) / aw;
+      const long long Dc = llround((ancj[a] - anc[a]) / double(spacing[a])) -
+                           llround(ct / double(spacing[a]) + 1e-6);
+      const long long k = llround(double(Dc) / N[a]);
+      macro += grad_p[a] * ((pjp[a] - pip[a]) - L[a] * double(k));
     }
     out.throat_dp[t] = (out.pore_pressure[li - 1] - out.pore_pressure[lj - 1]) - macro;
   }

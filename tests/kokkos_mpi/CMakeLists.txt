@@ -25,7 +25,7 @@ if(NOT MPIEXEC_EXECUTABLE)
 endif()
 
 enable_testing()
-foreach(t pnm_mpi)
+foreach(t pnm_mpi pnm_flow_mpi)
   add_executable(test_${t} test_${t}.cpp)
   target_include_directories(test_${t} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src

@@ -82,9 +82,22 @@ accumulated on **flow basins** (gradient-ascent assignment of *every* cell, incl
 whose center is inside the solid) — keyed on the segmentation labels alone, the near-wall
 staircase flux would bypass the interface (measured 6% on a tube).
 
-Validated in `scripts/verify_network_flow.py` (chamber-tube chain + asymmetric tube lattice,
-DNS by peclet.flow): every throat carries the DNS flux to ~1e-11 relative, residuals ~1e-12·F,
-g = Q/dp > 0 on all throats, and the dp sum around each loop equals the macroscopic drop.
+**Both IBM variants are supported.** With the cut-cell IBM the bookkeeping is machine-exact
+(pass `get_ox()...`). With the **ghost-cell IBM** (`set_ghost_projection(True)`) pass flow's
+`get_ox_proj()/get_oy_proj()/get_oz_proj()` — the binary (COUPLED) openness the ghost projection
+conserves. Ghost-cell IBM is pointwise 2nd-order but not locally mass-conserving at the wall, so
+there the network data is truncation-accurate: `pore_residual` becomes the per-pore wall leak
+(measured 3.2e-2·F at a 4-cell tube radius, converging at order ~2.7 under refinement).
+
+**MPI:** `extract_network_flow_mpi(sdf_local, global_shape_zyx, ..., u_local, ...)` runs the whole
+pipeline distributed on the core ORB blocks (fields from a distributed peclet.flow run on the
+same decomposition); every rank returns the identical global network. Matches the single-rank
+result to accumulation-order tolerance (`tests/kokkos_mpi/test_pnm_flow_mpi`, np = 1, 2, 4).
+
+Validated in `scripts/verify_network_flow.py` (chamber-tube chain + asymmetric tube lattice +
+the ghost-IBM chain, DNS by peclet.flow): every throat carries the DNS flux to ~1e-11 relative
+(cut-cell), residuals ~1e-12·F, g = Q/dp > 0 on all throats, and the dp sum around each loop
+equals the macroscopic drop.
 `scripts/demo_network_flow_packing.py` runs the pipeline on a real sphere packing. Caveats: two
 disjoint interfaces between the same two pores merge (pair-keyed throats); on loose packings
 (porosity ≳ 0.6) intra-pore pressure variation is comparable to throat drops, so per-throat

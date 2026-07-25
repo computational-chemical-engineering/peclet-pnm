@@ -29,6 +29,15 @@ is pure C++. Part of the peclet suite (see `../CLAUDE.md` and `../docs/` for sui
   `scripts/verify_network_flow.py` (|Q|=F to 1e-11 on tube networks, g>0, Kirchhoff exact).
   On loose packings per-throat g=Q/dp scatters (intra-pore viscous variation ~ throat drops —
   real physics, not a bug; the p field's grid-scale roughness μ∇²u·h ≈ 20× the macro gradient).
+  GHOST-CELL IBM (`set_ghost_projection`): pass flow's `get_ox_proj/...` (binary COUPLED
+  openness); bookkeeping is truncation-accurate there (ghost IBM is NOT locally conservative at
+  the wall — pore_residual = wall leak, 3.2e-2·F at r=4h, order ~2.7). MPI:
+  `extract_network_flow_mpi` (pore_extraction_mpi.hpp) — flow-basin labels resolved by
+  propagating the LABEL with the hold-at-ghost finalization trick; global network identical on
+  every rank. GOTCHA: periodic-image decisions (face min-image + the throat dp image count) MUST
+  anchor on integer peak-voxel coords / snapped-integer arithmetic — float-centroid anchoring
+  flips images at exactly L/2 under CUDA FMA wobble (measured flaky np4 failures on symmetric
+  lattices).
 - `pore_extraction_mpi.hpp` — the **distributed** pipeline (gated `PECLET_PNM_MPI`): core ORB
   decomposition + g=1 `GridHalo` exchange; labels are GLOBAL voxel ids so every fixpoint is
   decomposition-independent → **bit-exact to single-rank**. Stage design: local union-find CCL +

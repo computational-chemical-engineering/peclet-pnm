@@ -266,5 +266,52 @@ NB_MODULE(_pnm, m) {
       "ORB block (Nz,Ny,Nx C-order, from mpi_block). Returns (pores_owned_by_this_rank, "
       "segmentation_flat_local_block, connections_global). Bit-exact to the single-rank "
       "extract_pore_network on the gathered grid.");
+  m.def(
+      "extract_network_flow_mpi",
+      [](nb::ndarray<float, nb::c_contig> sdf_local, std::vector<int> global_shape_zyx,
+         std::vector<double> origin_zyx, std::vector<double> spacing_zyx,
+         nb::ndarray<double, nb::c_contig> u, nb::ndarray<double, nb::c_contig> v,
+         nb::ndarray<double, nb::c_contig> w, nb::ndarray<double, nb::c_contig> p,
+         std::optional<nb::ndarray<double, nb::c_contig>> ox,
+         std::optional<nb::ndarray<double, nb::c_contig>> oy,
+         std::optional<nb::ndarray<double, nb::c_contig>> oz, std::vector<double> grad_p_zyx) {
+        ensure_mpi_init();
+        std::array<int, 3> res;
+        auto sv = to_sdf(sdf_local, res);
+        std::array<int, 3> gd{global_shape_zyx[2], global_shape_zyx[1], global_shape_zyx[0]};
+        std::array<int, 3> bo{}, bs{};
+        pnm::mpi_block_of(gd, MPI_COMM_WORLD, bo, bs);
+        if (res != bs)
+          throw std::runtime_error("sdf_local shape does not match this rank's mpi_block");
+        if ((bool)ox != (bool)oy || (bool)ox != (bool)oz)
+          throw std::runtime_error("pass all three openness arrays (ox,oy,oz) or none");
+        std::array<float, 3> org{(float)origin_zyx[2], (float)origin_zyx[1], (float)origin_zyx[0]};
+        std::array<float, 3> spc{(float)spacing_zyx[2], (float)spacing_zyx[1],
+                                 (float)spacing_zyx[0]};
+        std::array<double, 3> gp{grad_p_zyx[2], grad_p_zyx[1], grad_p_zyx[0]};
+        auto net = pnm::extract_network_flow_mpi(
+            sv, gd, org, spc, to_field(u, res, "u"), to_field(v, res, "v"),
+            to_field(w, res, "w"), to_field(p, res, "p"),
+            ox ? to_field(*ox, res, "ox") : std::vector<double>{},
+            oy ? to_field(*oy, res, "oy") : std::vector<double>{},
+            oz ? to_field(*oz, res, "oz") : std::vector<double>{}, gp, MPI_COMM_WORLD);
+        nb::dict d;
+        d["pores"] = net.pores;
+        d["pore_pressure"] = net.pore_pressure;
+        d["pore_residual"] = net.pore_residual;
+        d["throats"] = net.throats;
+        d["throat_flow"] = net.throat_flow;
+        d["throat_area"] = net.throat_area;
+        d["throat_dp"] = net.throat_dp;
+        return d;
+      },
+      nb::arg("sdf_local"), nb::arg("global_shape_zyx"), nb::arg("origin_zyx"),
+      nb::arg("spacing_zyx"), nb::arg("u"), nb::arg("v"), nb::arg("w"), nb::arg("p"),
+      nb::arg("ox") = nb::none(), nb::arg("oy") = nb::none(), nb::arg("oz") = nb::none(),
+      nb::arg("grad_p_zyx") = std::vector<double>{0.0, 0.0, 0.0},
+      "Distributed network-flow extraction (collective over MPI_COMM_WORLD): all arrays are this "
+      "rank's ORB block (Nz,Ny,Nx C-order, from mpi_block; MAC fields from a distributed "
+      "peclet.flow run on the SAME BlockDecomposer). Returns the same dict as "
+      "extract_network_flow, GLOBAL and identical on every rank.");
 #endif
 }

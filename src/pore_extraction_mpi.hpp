@@ -196,6 +196,15 @@ inline std::vector<std::pair<Index, Index>> minByKey(std::size_t n, const KeyVal
 
 }  // namespace detail_mpi
 
+/// One owned pore-peak record of the distributed network-flow extraction (namespace-scope: nvcc
+/// forbids function-local types in extended-lambda captures).
+struct PoreRec {
+  int id;
+  int pgx, pgy, pgz;  // peak voxel global coords: the deterministic min-image anchor
+  Pore po;
+  double press;
+};
+
 /// Result of one distributed extraction. `pores` and `seg` are RANK-LOCAL (the pores whose peak
 /// voxel this rank owns; the dense labels of this rank's inner block, x-fastest);
 /// `connections` is the GLOBAL unique pair list, identical on every rank.
@@ -810,6 +819,525 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
         });
     space.fence();
     out.seg = downloadN(segI, nInner);
+  }
+  return out;
+}
+
+// ---- distributed network flow: throat flow rates + pore pressures from a MAC field ------------
+// The distributed counterpart of extract_network_flow_k (see pore_extraction.hpp for the method).
+// Composes with the validated distributed segmentation: runs extract_pore_network_mpi for the
+// labels, then re-stages the fields on a g=1 extended block and resolves the FLOW-BASIN label of
+// every cell by propagating the label itself with the same hold-at-ghost finalization scheme as
+// the pore roots (finalized = -label stored, pending = an in-block gid): no remote root-to-label
+// lookup ever needed. Fluxes/areas/centroids/residuals accumulate rank-locally over owned +faces
+// and are Allreduce-summed; the pore list (with trilinearly interpolated pressures, needing a
+// g=2 halo of p around each owned peak) is allgathered. EVERY rank returns the identical global
+// network. Bit-exact to the single-rank extract_network_flow_k up to float-sum ordering
+// (atomics) and the CUDA FMA-contraction wobble on pore centroids.
+inline NetworkFlow extract_network_flow_mpi(
+    const std::vector<float>& sdf_local, std::array<int, 3> gdims, std::array<float, 3> origin,
+    std::array<float, 3> spacing, const std::vector<double>& u_h, const std::vector<double>& v_h,
+    const std::vector<double>& w_h, const std::vector<double>& p_h,
+    const std::vector<double>& ox_h, const std::vector<double>& oy_h,
+    const std::vector<double>& oz_h, std::array<double, 3> grad_p, MPI_Comm comm) {
+  namespace dm = detail_mpi;
+  using peclet::core::View;
+  using peclet::core::halo::GridHalo;
+  using peclet::core::halo::GridHaloTopology;
+  NetworkFlow out;
+
+  // 1. distributed segmentation (validated pipeline) -> this rank's dense labels
+  MpiPoreNetwork base = extract_pore_network_mpi(sdf_local, gdims, origin, spacing, comm);
+
+  int rank = 0, nranks = 1;
+  MPI_Comm_rank(comm, &rank);
+  MPI_Comm_size(comm, &nranks);
+  peclet::core::decomp::BlockDecomposer<3> dec(static_cast<std::size_t>(nranks),
+                                               IVec<3>{gdims[0], gdims[1], gdims[2]});
+  constexpr int G = 1;
+  GridHaloTopology<3> topo;
+  topo.buildTopology(dec, rank, G, {true, true, true}, comm);
+  GridHalo<float> haloF;
+  haloF.init(topo);
+  GridHalo<Index> haloI;
+  haloI.init(topo);
+  GridHalo<int> haloS;
+  haloS.init(topo);
+  GridHalo<double> haloD;
+  haloD.init(topo);
+
+  const auto& idxr = topo.indexer();
+  BlockGeo geo{};
+  geo.ex = (int)idxr.sizeInclGhost()[0];
+  geo.ey = (int)idxr.sizeInclGhost()[1];
+  geo.ez = (int)idxr.sizeInclGhost()[2];
+  geo.ox = (int)idxr.originInclGhost()[0];
+  geo.oy = (int)idxr.originInclGhost()[1];
+  geo.oz = (int)idxr.originInclGhost()[2];
+  geo.nx = (int)idxr.sizeInner()[0];
+  geo.ny = (int)idxr.sizeInner()[1];
+  geo.nz = (int)idxr.sizeInner()[2];
+  geo.gnx = gdims[0];
+  geo.gny = gdims[1];
+  geo.gnz = gdims[2];
+  geo.g = G;
+  const std::size_t nInner = std::size_t(geo.nx) * geo.ny * geo.nz;
+  const std::size_t nExt = std::size_t(geo.ex) * geo.ey * geo.ez;
+  Exec space;
+  using MD3 = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
+  using R1 = Kokkos::RangePolicy<Exec>;
+  const auto inner = MD3(space, {0, 0, 0}, {geo.nx, geo.ny, geo.nz});
+  const BlockGeo g = geo;
+
+  // 2. stage sdf / seg / fields onto the extended block + exchange
+  auto stageF = [&](const std::vector<float>& h) {
+    View<float> e("nf::mpi::f", nExt), i0("nf::mpi::fi", nInner);
+    uploadVec(h, i0);
+    Kokkos::parallel_for(
+        "pnm::nfmpi::stageF", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          e(g.lidx(ix + 1, iy + 1, iz + 1)) = i0((Index(iz) * g.ny + iy) * g.nx + ix);
+        });
+    space.fence();
+    return e;
+  };
+  auto stageI = [&](const std::vector<int>& h) {
+    View<int> e("nf::mpi::s", nExt);
+    Kokkos::View<int*, Mem> i0("nf::mpi::si", nInner);
+    uploadVec(h, i0);
+    Kokkos::parallel_for(
+        "pnm::nfmpi::stageI", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          e(g.lidx(ix + 1, iy + 1, iz + 1)) = i0((Index(iz) * g.ny + iy) * g.nx + ix);
+        });
+    space.fence();
+    return e;
+  };
+  auto stageD = [&](const std::vector<double>& h, bool required) {
+    View<double> e("nf::mpi::d", (required || !h.empty()) ? nExt : 0);
+    if (h.empty())
+      return e;
+    View<double> i0("nf::mpi::di", nInner);
+    uploadVec(h, i0);
+    Kokkos::parallel_for(
+        "pnm::nfmpi::stageD", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          e(g.lidx(ix + 1, iy + 1, iz + 1)) = i0((Index(iz) * g.ny + iy) * g.nx + ix);
+        });
+    space.fence();
+    return e;
+  };
+  View<float> sdfE = stageF(sdf_local);
+  haloF.exchange(sdfE);
+  View<int> segE = stageI(base.seg);
+  haloS.exchange(segE);
+  View<double> uE = stageD(u_h, true), vE = stageD(v_h, true), wE = stageD(w_h, true);
+  haloD.exchange(uE);
+  haloD.exchange(vE);
+  haloD.exchange(wE);
+  const bool hasOpen = !ox_h.empty();
+  View<double> oxE = stageD(ox_h, false), oyE = stageD(oy_h, false), ozE = stageD(oz_h, false);
+  if (hasOpen) {
+    haloD.exchange(oxE);
+    haloD.exchange(oyE);
+    haloD.exchange(ozE);
+  }
+
+  // 3. flow-basin labels for EVERY cell: propagate the LABEL along the steepest-ascent forest.
+  // State per cell (Index field): finalized = -(label+1) (label 0 = enclosed solid basin, no
+  // pore); pending = the in-block gid currently held. Pore cells finalize immediately with their
+  // own seg label; solid maxima finalize as 0; everything else chases, adopting only finalized
+  // ghost values (never storing an out-of-block gid).
+  View<Index> labWork("pnm::nfmpi::labWork", nExt);
+  {
+    Kokkos::deep_copy(labWork, Index(-1));  // ghosts: "finalized, label 0" until exchanged
+    Kokkos::parallel_for(
+        "pnm::nfmpi::basin_init", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
+          const Index ci = g.lidx(lx, ly, lz);
+          if (sdfE(ci) > 0.0f) {  // pore cell: basin label is its own segmentation label
+            labWork(ci) = -(Index(segE(ci)) + 1);
+            return;
+          }
+          const Index cgid = g.gidAt(lx, ly, lz);
+          Index best = cgid;
+          float bv = sdfE(ci);
+          for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+              for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0)
+                  continue;
+                const float nv = sdfE(g.lidx(lx + dx, ly + dy, lz + dz));
+                const Index ngid = g.gidAt(lx + dx, ly + dy, lz + dz);
+                if (nv > bv) {
+                  bv = nv;
+                  best = ngid;
+                } else if (nv == bv && ngid > best)
+                  best = ngid;
+              }
+          labWork(ci) = (best == cgid) ? Index(-1) : best;  // solid max: label 0 (excluded)
+        });
+    space.fence();
+    int rounds = 0;
+    for (;;) {
+      haloI.exchange(labWork);
+      int pending = 0;
+      Kokkos::parallel_reduce(
+          "pnm::nfmpi::basin_resolve", R1(space, 0, nInner),
+          KOKKOS_LAMBDA(std::size_t o, int& pend) {
+            const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
+                      iz = int(o / (Index(g.nx) * g.ny));
+            const Index ci = g.lidx(ix + 1, iy + 1, iz + 1);
+            Index t = labWork(ci);
+            if (t < 0)
+              return;  // finalized
+            for (int s0 = 0; s0 < 64; ++s0) {
+              const Index tl = g.localOf(t);
+              if (tl < 0)
+                break;
+              const Index tv = labWork(tl);
+              if (tv < 0) {  // that cell knows its basin label: adopt, finalized
+                t = tv;
+                break;
+              }
+              const Index nl = g.localOf(tv);
+              if (nl < 0)
+                break;  // next hop leaves the block: hold, wait for its owner
+              t = tv;
+            }
+            if (t != labWork(ci))
+              labWork(ci) = t;
+            if (t >= 0)
+              pend += 1;
+          },
+          pending);
+      space.fence();
+      int globalPending = 0;
+      MPI_Allreduce(&pending, &globalPending, 1, MPI_INT, MPI_SUM, comm);
+      if (!globalPending)
+        break;
+      if (++rounds > 100000) {
+        std::fprintf(stderr, "[pnm::mpi] flow-basin resolution did not converge\n");
+        MPI_Abort(comm, 3);
+      }
+    }
+  }
+  View<int> flowLab("pnm::nfmpi::flowLab", nExt);
+  Kokkos::parallel_for(
+      "pnm::nfmpi::basin_label", R1(space, 0, nExt),
+      KOKKOS_LAMBDA(std::size_t e) { flowLab(e) = int(-labWork(e) - 1); });
+  space.fence();
+  haloS.exchange(flowLab);
+
+  // 4. global pore list: each owned basin peak emits (id, Pore, trilinear pressure). The 2x2x2
+  // interpolation cube around a peak can reach 2 cells out, so p gets its own g=2 halo.
+  int np = 0;
+  {
+    int npLoc = 0;
+    Kokkos::parallel_reduce(
+        "pnm::nfmpi::np", R1(space, 0, nInner),
+        KOKKOS_LAMBDA(std::size_t o, int& m) {
+          const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
+                    iz = int(o / (Index(g.nx) * g.ny));
+          const int sv = segE(g.lidx(ix + 1, iy + 1, iz + 1));
+          if (sv > m)
+            m = sv;
+        },
+        Kokkos::Max<int>(npLoc));
+    space.fence();
+    MPI_Allreduce(&npLoc, &np, 1, MPI_INT, MPI_MAX, comm);
+  }
+  if (np == 0)
+    return out;
+
+  GridHaloTopology<3> topo2;
+  topo2.buildTopology(dec, rank, 2, {true, true, true}, comm);
+  GridHalo<double> haloP2;
+  haloP2.init(topo2);
+  const auto& idxr2 = topo2.indexer();
+  BlockGeo g2{};
+  g2.ex = (int)idxr2.sizeInclGhost()[0];
+  g2.ey = (int)idxr2.sizeInclGhost()[1];
+  g2.ez = (int)idxr2.sizeInclGhost()[2];
+  g2.ox = (int)idxr2.originInclGhost()[0];
+  g2.oy = (int)idxr2.originInclGhost()[1];
+  g2.oz = (int)idxr2.originInclGhost()[2];
+  g2.nx = geo.nx;
+  g2.ny = geo.ny;
+  g2.nz = geo.nz;
+  g2.gnx = gdims[0];
+  g2.gny = gdims[1];
+  g2.gnz = gdims[2];
+  g2.g = 2;
+  View<double> pE2("pnm::nfmpi::pE2", std::size_t(g2.ex) * g2.ey * g2.ez);
+  {
+    View<double> i0("pnm::nfmpi::pi", nInner);
+    uploadVec(p_h, i0);
+    const BlockGeo gg = g2;
+    Kokkos::parallel_for(
+        "pnm::nfmpi::stageP2", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          pE2(gg.lidx(ix + 2, iy + 2, iz + 2)) = i0((Index(iz) * g.ny + iy) * g.nx + ix);
+        });
+    space.fence();
+  }
+  haloP2.exchange(pE2);
+
+  std::vector<PoreRec> recs;
+  {
+    Kokkos::View<PoreRec*, Mem> buf("pnm::nfmpi::precs", nInner ? nInner : 1);
+    Kokkos::View<int, Mem> cnt("pnm::nfmpi::pcnt");
+    Kokkos::deep_copy(cnt, 0);
+    const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
+    const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
+    const BlockGeo gg = g2;
+    Kokkos::parallel_for(
+        "pnm::nfmpi::pores", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
+          const Index ci = g.lidx(lx, ly, lz);
+          const float cv = sdfE(ci);
+          if (cv <= 0.0f)
+            return;
+          const Index cgid = g.gidAt(lx, ly, lz);
+          bool peak = true;
+          for (int dz = -1; dz <= 1 && peak; ++dz)
+            for (int dy = -1; dy <= 1 && peak; ++dy)
+              for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0)
+                  continue;
+                const float nv = sdfE(g.lidx(lx + dx, ly + dy, lz + dz));
+                const Index ngid = g.gidAt(lx + dx, ly + dy, lz + dz);
+                if (nv > cv || (nv == cv && ngid > cgid)) {
+                  peak = false;
+                  break;
+                }
+              }
+          if (!peak)
+            return;
+          float sw = 0.0f, px = 0.0f, py = 0.0f, pz = 0.0f;
+          for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+              for (int dx = -1; dx <= 1; ++dx) {
+                const float v0 = sdfE(g.lidx(lx + dx, ly + dy, lz + dz));
+                float w0 = v0 > 0.0f ? v0 : 0.0f;
+                w0 = w0 * w0;
+                sw += w0;
+                px += dx * w0;
+                py += dy * w0;
+                pz += dz * w0;
+              }
+          float fx = 0, fy = 0, fz = 0;
+          if (sw > 1e-6f) {
+            fx = px / sw;
+            fy = py / sw;
+            fz = pz / sw;
+          }
+          const int gx = BlockGeo::wrapc(g.ox + lx, g.gnx), gy = BlockGeo::wrapc(g.oy + ly, g.gny),
+                    gz = BlockGeo::wrapc(g.oz + lz, g.gnz);
+          PoreRec rec;
+          rec.id = segE(ci);
+          rec.pgx = gx;
+          rec.pgy = gy;
+          rec.pgz = gz;
+          rec.po = Pore{oxo + (gx + fx) * sx, oyo + (gy + fy) * sy, ozo + (gz + fz) * sz, cv};
+          // trilinear p at the refined position: base cells are within peak +- 2 (g2 ring)
+          const double gp3[3] = {(rec.po.x - oxo) / sx, (rec.po.y - oyo) / sy,
+                                 (rec.po.z - ozo) / sz};
+          int b[3];
+          double f[3];
+          for (int a = 0; a < 3; ++a) {
+            const double fl = Kokkos::floor(gp3[a]);
+            b[a] = int(fl);
+            f[a] = gp3[a] - fl;
+          }
+          double acc = 0.0;
+          for (int dz = 0; dz < 2; ++dz)
+            for (int dy = 0; dy < 2; ++dy)
+              for (int dx = 0; dx < 2; ++dx) {
+                const double wt = (dx ? f[0] : 1.0 - f[0]) * (dy ? f[1] : 1.0 - f[1]) *
+                                  (dz ? f[2] : 1.0 - f[2]);
+                const Index e2 = gg.localOf(
+                    (Index(BlockGeo::wrapc(b[2] + dz, gg.gnz)) * gg.gny +
+                     BlockGeo::wrapc(b[1] + dy, gg.gny)) *
+                        gg.gnx +
+                    BlockGeo::wrapc(b[0] + dx, gg.gnx));
+                acc += wt * pE2(e2);
+              }
+          rec.press = acc;
+          const int s0 = Kokkos::atomic_fetch_add(&cnt(), 1);
+          buf(s0) = rec;
+        });
+    space.fence();
+    auto hc = Kokkos::create_mirror_view(cnt);
+    Kokkos::deep_copy(hc, cnt);
+    recs = downloadN(buf, std::size_t(hc()));
+  }
+  auto allRecs = dm::allgatherv(recs, comm);
+  out.pores.resize(np);
+  out.pore_pressure.assign(np, 0.0);
+  std::vector<double> ancX(np), ancY(np), ancZ(np);  // peak-voxel min-image anchors
+  for (const auto& r0 : allRecs) {
+    out.pores[r0.id - 1] = r0.po;
+    out.pore_pressure[r0.id - 1] = r0.press;
+    ancX[r0.id - 1] = origin[0] + r0.pgx * double(spacing[0]);
+    ancY[r0.id - 1] = origin[1] + r0.pgy * double(spacing[1]);
+    ancZ[r0.id - 1] = origin[2] + r0.pgz * double(spacing[2]);
+  }
+  View<double> ancXD("pnm::nfmpi::ancX", np), ancYD("pnm::nfmpi::ancY", np),
+      ancZD("pnm::nfmpi::ancZ", np);
+  uploadVec(ancX, ancXD);
+  uploadVec(ancY, ancYD);
+  uploadVec(ancZ, ancZD);
+
+  // 5. throat keys from owned +faces of the flow-basin field (open faces only), global unique
+  {
+    const bool ho = hasOpen;
+    const std::int64_t maxp = std::int64_t(nInner) * 3;
+    Kokkos::View<std::int64_t*, Mem> praw("pnm::nfmpi::praw", std::size_t(maxp));
+    Kokkos::View<int, Mem> pcnt("pnm::nfmpi::prawcnt");
+    Kokkos::deep_copy(pcnt, 0);
+    Kokkos::parallel_for(
+        "pnm::nfmpi::throat_pairs", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
+          const int a = flowLab(g.lidx(lx, ly, lz));
+          for (int d = 0; d < 3; ++d) {
+            const Index nb = g.lidx(lx + (d == 0), ly + (d == 1), lz + (d == 2));
+            const int b = flowLab(nb);
+            if (a == b || a <= 0 || b <= 0)
+              continue;
+            const double opn = ho ? (d == 0 ? oxE(nb) : (d == 1 ? oyE(nb) : ozE(nb))) : 1.0;
+            if (opn <= 0.0)
+              continue;
+            const int lo = a < b ? a : b, hi = a < b ? b : a;
+            const int s0 = Kokkos::atomic_fetch_add(&pcnt(), 1);
+            if (s0 < maxp)
+              praw(s0) = (std::int64_t(lo) << 32) | hi;
+          }
+        });
+    space.fence();
+    auto hc = Kokkos::create_mirror_view(pcnt);
+    Kokkos::deep_copy(hc, pcnt);
+    auto loc = downloadN(praw, std::size_t(std::min<std::int64_t>(hc(), maxp)));
+    std::sort(loc.begin(), loc.end());
+    loc.erase(std::unique(loc.begin(), loc.end()), loc.end());
+    auto all = dm::allgatherv(loc, comm);
+    std::sort(all.begin(), all.end());
+    all.erase(std::unique(all.begin(), all.end()), all.end());
+    for (auto k : all)
+      out.throats.push_back({int(k >> 32), int(k & 0x7fffffff)});
+  }
+  const std::size_t nt = out.throats.size();
+  std::vector<std::int64_t> keys(nt);
+  for (std::size_t t = 0; t < nt; ++t)
+    keys[t] = (std::int64_t(out.throats[t].first) << 32) | out.throats[t].second;
+  Kokkos::View<std::int64_t*, Mem> keyD("pnm::nfmpi::keys", nt);
+  uploadVec(keys, keyD);
+
+  // 6. rank-local accumulation over owned +faces, then a global sum-reduce
+  std::vector<double> Qh(nt, 0.0), Ah(nt, 0.0), Cxh(nt, 0.0), Cyh(nt, 0.0), Czh(nt, 0.0),
+      Rh(np, 0.0);
+  {
+    View<double> Q("pnm::nfmpi::Q", nt), A("pnm::nfmpi::A", nt), Cx("pnm::nfmpi::Cx", nt),
+        Cy("pnm::nfmpi::Cy", nt), Cz("pnm::nfmpi::Cz", nt), resid("pnm::nfmpi::res", np);
+    const double Axf = double(spacing[1]) * spacing[2], Ayf = double(spacing[0]) * spacing[2],
+                 Azf = double(spacing[0]) * spacing[1];
+    const std::int64_t ntl = std::int64_t(nt);
+    const bool ho = hasOpen;
+    const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
+    const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
+    const double Lx = double(g.gnx) * sx, Ly = double(g.gny) * sy, Lz = double(g.gnz) * sz;
+    Kokkos::parallel_for(
+        "pnm::nfmpi::throat_flux", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
+          const int a = flowLab(g.lidx(lx, ly, lz));
+          for (int d = 0; d < 3; ++d) {
+            const Index nb = g.lidx(lx + (d == 0), ly + (d == 1), lz + (d == 2));
+            const int b = flowLab(nb);
+            if (a == b)
+              continue;
+            const double vel = d == 0 ? uE(nb) : (d == 1 ? vE(nb) : wE(nb));
+            const double opn = ho ? (d == 0 ? oxE(nb) : (d == 1 ? oyE(nb) : ozE(nb))) : 1.0;
+            const double area = d == 0 ? Axf : (d == 1 ? Ayf : Azf);
+            const double q = opn * vel * area;
+            if (a > 0)
+              Kokkos::atomic_add(&resid(a - 1), q);
+            if (b > 0)
+              Kokkos::atomic_add(&resid(b - 1), -q);
+            if (a > 0 && b > 0 && opn > 0.0) {
+              const int lo = a < b ? a : b, hi = a < b ? b : a;
+              const std::int64_t key = (std::int64_t(lo) << 32) | hi;
+              std::int64_t l = 0, hgh = ntl - 1, slot = -1;
+              while (l <= hgh) {
+                const std::int64_t mid = l + (hgh - l) / 2;
+                if (keyD(mid) == key) {
+                  slot = mid;
+                  break;
+                }
+                if (keyD(mid) < key)
+                  l = mid + 1;
+                else
+                  hgh = mid - 1;
+              }
+              if (slot >= 0) {
+                const double w0 = opn * area;
+                Kokkos::atomic_add(&Q(slot), a < b ? q : -q);
+                Kokkos::atomic_add(&A(slot), w0);
+                const int gx = BlockGeo::wrapc(g.ox + lx, g.gnx),
+                          gy = BlockGeo::wrapc(g.oy + ly, g.gny),
+                          gz = BlockGeo::wrapc(g.oz + lz, g.gnz);
+                double fp[3] = {oxo + (gx + (d == 0 ? 0.5 : 0.0)) * double(sx),
+                                oyo + (gy + (d == 1 ? 0.5 : 0.0)) * double(sy),
+                                ozo + (gz + (d == 2 ? 0.5 : 0.0)) * double(sz)};
+                const double pc[3] = {ancXD(lo - 1), ancYD(lo - 1), ancZD(lo - 1)};
+                const double Lw[3] = {Lx, Ly, Lz};
+                for (int a2 = 0; a2 < 3; ++a2) {
+                  double dv = fp[a2] - pc[a2];
+                  dv -= Lw[a2] * Kokkos::round(dv / Lw[a2]);
+                  fp[a2] = dv;
+                }
+                Kokkos::atomic_add(&Cx(slot), w0 * fp[0]);
+                Kokkos::atomic_add(&Cy(slot), w0 * fp[1]);
+                Kokkos::atomic_add(&Cz(slot), w0 * fp[2]);
+              }
+            }
+          }
+        });
+    space.fence();
+    auto red = [&](const View<double>& d, std::vector<double>& h) {
+      auto loc = downloadN(d, h.size());
+      MPI_Allreduce(loc.data(), h.data(), int(h.size()), MPI_DOUBLE, MPI_SUM, comm);
+    };
+    red(Q, Qh);
+    red(A, Ah);
+    red(Cx, Cxh);
+    red(Cy, Cyh);
+    red(Cz, Czh);
+    red(resid, Rh);
+  }
+  out.throat_flow = Qh;
+  out.throat_area = Ah;
+  out.pore_residual = Rh;
+
+  // 7. dp: identical on every rank (throat-anchored two-leg min-image, as single-rank)
+  out.throat_dp.resize(nt);
+  const double L[3] = {double(gdims[0]) * spacing[0], double(gdims[1]) * spacing[1],
+                       double(gdims[2]) * spacing[2]};
+  for (std::size_t t = 0; t < nt; ++t) {
+    const int li = out.throats[t].first, lj = out.throats[t].second;
+    const Pore& pi = out.pores[li - 1];
+    const Pore& pj = out.pores[lj - 1];
+    const double aw = out.throat_area[t];
+    const double anc[3] = {ancX[li - 1], ancY[li - 1], ancZ[li - 1]};
+    const double ancj[3] = {ancX[lj - 1], ancY[lj - 1], ancZ[lj - 1]};
+    double macro = 0.0;
+    const double pip[3] = {double(pi.x), double(pi.y), double(pi.z)};
+    const double pjp[3] = {double(pj.x), double(pj.y), double(pj.z)};
+    const int N[3] = {gdims[0], gdims[1], gdims[2]};
+    for (int a = 0; a < 3; ++a) {
+      // identical snapped-integer image decision as the single-rank path (see pore_extraction.hpp)
+      const double ct = (Cxh[t] * (a == 0) + Cyh[t] * (a == 1) + Czh[t] * (a == 2)) / aw;
+      const long long Dc = llround((ancj[a] - anc[a]) / double(spacing[a])) -
+                           llround(ct / double(spacing[a]) + 1e-6);
+      const long long k = llround(double(Dc) / N[a]);
+      macro += grad_p[a] * ((pjp[a] - pip[a]) - L[a] * double(k));
+    }
+    out.throat_dp[t] = (out.pore_pressure[li - 1] - out.pore_pressure[lj - 1]) - macro;
   }
   return out;
 }

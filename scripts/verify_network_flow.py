@@ -139,6 +139,53 @@ check("case2 g>0 on all throats", bool(np.all(Q2 * dp2 > 0)),
 check("case2 total flux", abs(np.abs(Q2).sum() / 3.0 - abs(F2)) < 1e-2 * abs(F2),
       f"sum|Q|/3 = {np.abs(Q2).sum()/3.0:.4e} vs F = {F2:.4e}")
 
+# ================= case 3: ghost-cell IBM variant (set_ghost_projection) =======================
+# Same chamber-tube chain, solved with the directional ghost-cell projection. The projection
+# there conserves fluxes through the BINARY (COUPLED) openness — flow's get_*_proj getters
+# return the operative openness in either mode, so the same extraction call works for both IBMs.
+print("\n=== case 3: chamber-tube chain, ghost-cell IBM ===")
+del s
+s = peclet.flow.Solver(NX, NY, NZ)
+s.set_rho(1.0); s.set_mu(MU); s.set_dt(100.0)
+s.set_body_force(FX, 0.0, 0.0)
+s.set_ghost_projection(True)
+s.set_solid(np.asfortranarray(sdf), cutcell_pressure=True)
+for _ in range(60):
+    s.step()
+u, v, w, p = s.get_uf(), s.get_vf(), s.get_wf(), s.get_p()
+ox, oy, oz = s.get_ox_proj(), s.get_oy_proj(), s.get_oz_proj()
+F3_planes = np.array([(ox[i, :, :] * u[i, :, :]).sum() for i in range(NX)])
+F3 = F3_planes.mean()
+plane_dev3 = np.abs(F3_planes - F3).max() / abs(F3)
+net3 = pnm.extract_network_flow(
+    np.ascontiguousarray(sdf.T, dtype=np.float32), [0.0, 0.0, 0.0], [1.0, 1.0, 1.0],
+    np.ascontiguousarray(u.T), np.ascontiguousarray(v.T), np.ascontiguousarray(w.T),
+    np.ascontiguousarray(p.T), np.ascontiguousarray(ox.T), np.ascontiguousarray(oy.T),
+    np.ascontiguousarray(oz.T), grad_p_zyx=[0.0, 0.0, -FX])
+Q3 = np.array(net3["throat_flow"])
+dp3 = np.array(net3["throat_dp"])
+res3 = np.array(net3["pore_residual"])
+print(f"ghost DNS flux F = {F3:.6e} (vs cut-cell {F:.6e}); "
+      f"{len(net3['pores'])} pores, {len(Q3)} throats")
+for t, (a, b) in enumerate(net3["throats"]):
+    print(f"  throat {a}-{b}: Q={Q3[t]: .6e}  dp={dp3[t]: .4e}")
+# Ghost-cell IBM is pointwise 2nd-order but NOT locally mass-conserving at the wall (the
+# closure rows absorb truncation error as wall transpiration), so the network bookkeeping is
+# truncation-accurate here, not machine-exact: pore_residual becomes the per-pore wall leak.
+# Measured on this geometry: residual/F 3.2e-2 (h) -> 4.9e-3 (h/2), order ~2.7; ||Q|-F|/F
+# order ~1.8. Tolerances below are set for THIS resolution (tube radius = 4 cells).
+check("case3 steady plane flux (truncation)", plane_dev3 < 5e-2,
+      f"max deviation {plane_dev3:.2e} (wall transpiration, converges ~O(h^2))")
+check("case3 mass residuals (truncation)", np.abs(res3).max() < 5e-2 * abs(F3),
+      f"max |residual|/F = {np.abs(res3).max()/abs(F3):.2e}")
+check("case3 throat flux = DNS flux (truncation)",
+      np.abs(np.abs(Q3) - abs(F3)).max() < 6e-2 * abs(F3),
+      f"max ||Q|-F|/F = {np.abs(np.abs(Q3)-abs(F3)).max()/abs(F3):.2e}")
+check("case3 g>0 on all throats", bool(np.all(Q3 * dp3 > 0)),
+      f"signs: {np.sign(Q3*dp3).astype(int).tolist()}")
+check("case3 flux agrees with cut-cell IBM", abs(F3 - F) < 0.10 * abs(F),
+      f"rel diff {(F3-F)/F:.2%} (coarse tube: r = 4 cells)")
+
 print("PASS" if fails == 0 else f"FAIL ({fails})")
 del s  # release the solver's device Views BEFORE interpreter exit (flow's finalize contract)
 sys.exit(1 if fails else 0)
