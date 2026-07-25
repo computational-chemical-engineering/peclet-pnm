@@ -475,9 +475,10 @@ inline std::vector<std::pair<int, int>> extract_topology_k(const std::vector<int
 //     centroid refinement as extract_pores; p is trilinearly interpolated there (periodic).
 // Conventions (flow's MAC layout): u(i,j,k) lives on the -x face of cell (i,j,k); ox is that
 // face's openness (fluid area fraction); cell centers sit at origin + i*spacing (pnm convention).
-// CAVEAT: throats are keyed by label PAIR — two disjoint interfaces between the same two pores
-// (e.g. once directly and once through the periodic wrap) merge into one entry and their fluxes
-// add (possibly cancelling). The Voronoi network kept such parallel throats separate.
+// Throats are PER-PATCH: a throat is a CONNECTED patch of interface faces, so two disjoint
+// interfaces between the same two pores (e.g. once directly and once through the periodic wrap)
+// are separate parallel throats — `throats` can repeat the same label pair. Like the Voronoi
+// network, where each throat was its own facet object.
 struct NetworkFlow {
   std::vector<Pore> pores;                   // ordered by pore label id (pores[k] <-> label k+1)
   std::vector<double> pore_pressure;         // periodic-part p at the pore center (trilinear)
@@ -650,49 +651,215 @@ inline NetworkFlow extract_network_flow_k(
     space.fence();
   }
 
-  // throat list: adjacent flow-basin pairs with OPEN interface faces (o > 0)
+  // ---- per-patch throats: CCL over the interface FACES -------------------------------------
+  // A throat is a CONNECTED patch of open interface faces, not the whole label pair: two pores
+  // touching at two disjoint places (e.g. once directly and once through the periodic wrap) are
+  // two parallel throats — pair-keyed, their fluxes would merge and can cancel. Faces are
+  // identified by fid = 3*cell + d (the +d face of `cell`); two interface faces of the SAME pair
+  // connect when their (doubled) center offset satisfies |2*dc + e_d' - e_d|^2 <= 8 — a generous
+  // edge/corner adjacency in pure integer arithmetic (periodic-safe, decomposition-independent).
+  // Each patch is keyed by its minimum fid, so the throat list is grid-deterministic.
+  // Two-tier patching: CORE faces — both cells FLUID-centered (sdf > 0) — define the patches by
+  // CCL; FILM faces (at least one solid-centered cell; they exist only because the flow basins
+  // extend into the cut-cell staircase) then ATTACH to the minimum reachable core patch by label
+  // propagation, so a film can never bridge two core patches into one. The fluid-centered
+  // criterion is geometric and parameter-free: a wall-hugging film cannot contain a core face by
+  // construction (measured: an openness threshold could not separate two capsule throats bridged
+  // by a wall film whose staircase faces reach openness ~0.7). Films reaching no core patch
+  // become their own patches. Every interface face lands in exactly one patch — exact bookkeeping.
+  const std::size_t nf = 3 * n;
+  constexpr std::int64_t kSent = 0x7ffffffffffffffeLL;
+  Kokkos::View<std::int64_t*, Mem> fpar("nf::fpar", nf);   // final patch label per face, -1 = none
+  Kokkos::View<std::int64_t*, Mem> fpair("nf::fpair", nf); // (lo<<32|hi) pair key per face
   {
     const I3 r = res;
     const bool ho = hasOpen;
-    const std::int64_t maxp = static_cast<std::int64_t>(n) * 3;
-    Kokkos::View<std::int64_t*, Mem> praw("nf::praw", static_cast<std::size_t>(maxp));
-    Kokkos::View<int, Mem> pcnt("nf::pcnt");
-    Kokkos::deep_copy(pcnt, 0);
     using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
+    const auto full3 = MD(space, {0, 0, 0}, {r.x, r.y, r.z});
+    Kokkos::View<std::int64_t*, Mem> par("nf::fccl", nf);  // CCL parents (core, then leftover)
+    Kokkos::View<char*, Mem> core("nf::fcore", nf);
     Kokkos::parallel_for(
-        "nf::throat_pairs", MD(space, {0, 0, 0}, {r.x, r.y, r.z}),
-        KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
+        "nf::face_init", full3, KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
           const int c = get_idx(ixx, iyy, izz, r);
-          const int a = flowLab(c);
           for (int d = 0; d < 3; ++d) {
+            const std::int64_t f = 3 * std::int64_t(c) + d;
             const int nb = get_idx(ixx + (d == 0), iyy + (d == 1), izz + (d == 2), r);
-            const int b = flowLab(nb);
-            if (a == b || a <= 0 || b <= 0)
-              continue;
+            const int a = flowLab(c), b = flowLab(nb);
             const double opn = ho ? (d == 0 ? ox(nb) : (d == 1 ? oy(nb) : oz(nb))) : 1.0;
-            if (opn <= 0.0)
-              continue;
-            const int lo = a < b ? a : b, hi = a < b ? b : a;
-            const int s0 = Kokkos::atomic_fetch_add(&pcnt(), 1);
-            if (s0 < maxp)
-              praw(s0) = (static_cast<std::int64_t>(lo) << 32) | hi;
+            const bool itf = (a != b && a > 0 && b > 0 && opn > 0.0);
+            core(f) = (itf && sdf(c) > 0.0f && sdf(nb) > 0.0f) ? 1 : 0;
+            par(f) = core(f) ? f : -1;
+            fpar(f) = itf ? (core(f) ? f : kSent) : -1;  // film: sentinel until attached
+            fpair(f) = itf ? ((std::int64_t(a < b ? a : b) << 32) | (a < b ? b : a)) : -1;
           }
         });
     space.fence();
-    auto hc = Kokkos::create_mirror_view(pcnt);
-    Kokkos::deep_copy(hc, pcnt);
-    auto keys0 = downloadN(praw, static_cast<std::size_t>(std::min<std::int64_t>(hc(), maxp)));
-    std::sort(keys0.begin(), keys0.end());
-    keys0.erase(std::unique(keys0.begin(), keys0.end()), keys0.end());
-    for (auto k : keys0)
-      out.throats.push_back({static_cast<int>(k >> 32), static_cast<int>(k & 0x7fffffff)});
+    Kokkos::View<int, Mem> changed("nf::fchanged");
+    // one CCL fixpoint over the faces with par >= 0 (used twice: core tier, then leftover films)
+    auto cclPass = [&]() {
+      int h_changed = 1;
+      while (h_changed) {
+        Kokkos::deep_copy(changed, 0);
+        Kokkos::parallel_for(
+            "nf::face_merge", full3, KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
+              const int c = get_idx(ixx, iyy, izz, r);
+              for (int d = 0; d < 3; ++d) {
+                const std::int64_t f = 3 * std::int64_t(c) + d;
+                if (par(f) < 0)
+                  continue;
+                const std::int64_t pk = fpair(f);
+                for (int dz = -1; dz <= 1; ++dz)
+                  for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                      const int c2 = get_idx(ixx + dx, iyy + dy, izz + dz, r);
+                      for (int d2 = 0; d2 < 3; ++d2) {
+                        const std::int64_t f2 = 3 * std::int64_t(c2) + d2;
+                        if (f2 == f || par(f2) < 0 || fpair(f2) != pk)
+                          continue;
+                        const int Dx = 2 * dx + (d2 == 0) - (d == 0);
+                        const int Dy = 2 * dy + (d2 == 1) - (d == 1);
+                        const int Dz = 2 * dz + (d2 == 2) - (d == 2);
+                        if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
+                          continue;
+                        std::int64_t rm = f;
+                        while (rm != par(rm))
+                          rm = par(rm);
+                        std::int64_t rn = f2;
+                        while (rn != par(rn))
+                          rn = par(rn);
+                        if (rm != rn) {
+                          const std::int64_t sml = rm < rn ? rm : rn, lrg = rm < rn ? rn : rm;
+                          Kokkos::atomic_min(&par(lrg), sml);
+                          changed() = 1;
+                        }
+                      }
+                    }
+              }
+            });
+        space.fence();
+        Kokkos::parallel_for(
+            "nf::face_flatten", Kokkos::RangePolicy<Exec>(space, 0, nf),
+            KOKKOS_LAMBDA(std::size_t f) {
+              std::int64_t l = par(f);
+              if (l >= 0) {
+                while (l != par(l))
+                  l = par(l);
+                par(f) = l;
+              }
+            });
+        space.fence();
+        auto hc = Kokkos::create_mirror_view(changed);
+        Kokkos::deep_copy(hc, changed);
+        h_changed = hc();
+      }
+    };
+    cclPass();  // core tier
+    Kokkos::parallel_for(
+        "nf::core_label", Kokkos::RangePolicy<Exec>(space, 0, nf), KOKKOS_LAMBDA(std::size_t f) {
+          if (core(f))
+            fpar(f) = par(f);
+        });
+    space.fence();
+    // film attachment: min reachable core-patch label, propagated through films (Jacobi min)
+    int h_changed = 1;
+    while (h_changed) {
+      Kokkos::deep_copy(changed, 0);
+      Kokkos::parallel_for(
+          "nf::film_attach", full3, KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
+            const int c = get_idx(ixx, iyy, izz, r);
+            for (int d = 0; d < 3; ++d) {
+              const std::int64_t f = 3 * std::int64_t(c) + d;
+              if (fpar(f) < 0 || core(f))
+                continue;
+              std::int64_t best = fpar(f);
+              const std::int64_t pk = fpair(f);
+              for (int dz = -1; dz <= 1; ++dz)
+                for (int dy = -1; dy <= 1; ++dy)
+                  for (int dx = -1; dx <= 1; ++dx) {
+                    const int c2 = get_idx(ixx + dx, iyy + dy, izz + dz, r);
+                    for (int d2 = 0; d2 < 3; ++d2) {
+                      const std::int64_t f2 = 3 * std::int64_t(c2) + d2;
+                      if (f2 == f || fpair(f2) != pk)
+                        continue;
+                      const std::int64_t l2 = fpar(f2);
+                      if (l2 < 0 || l2 >= kSent || l2 >= best)
+                        continue;
+                      const int Dx = 2 * dx + (d2 == 0) - (d == 0);
+                      const int Dy = 2 * dy + (d2 == 1) - (d == 1);
+                      const int Dz = 2 * dz + (d2 == 2) - (d == 2);
+                      if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
+                        continue;
+                      best = l2;
+                    }
+                  }
+              if (best < fpar(f)) {
+                fpar(f) = best;
+                changed() = 1;
+              }
+            }
+          });
+      space.fence();
+      auto hc = Kokkos::create_mirror_view(changed);
+      Kokkos::deep_copy(hc, changed);
+      h_changed = hc();
+    }
+    // leftover films (no core patch reachable): their own patches by a second CCL tier
+    Kokkos::parallel_for(
+        "nf::leftover_init", Kokkos::RangePolicy<Exec>(space, 0, nf),
+        KOKKOS_LAMBDA(std::size_t f) { par(f) = (fpar(f) == kSent) ? std::int64_t(f) : -1; });
+    space.fence();
+    cclPass();
+    Kokkos::parallel_for(
+        "nf::leftover_label", Kokkos::RangePolicy<Exec>(space, 0, nf),
+        KOKKOS_LAMBDA(std::size_t f) {
+          if (fpar(f) == kSent)
+            fpar(f) = par(f);
+        });
+    space.fence();
+  }
+  // unique patch roots -> throat slots, ordered by (pair, root fid)
+  std::vector<std::int64_t> rootF, rootSlotKey;
+  {
+    Kokkos::View<std::int64_t*, Mem> rbuf("nf::rbuf", nf ? nf : 1), pbuf("nf::pbuf", nf ? nf : 1);
+    Kokkos::View<int, Mem> rcnt("nf::rcnt");
+    Kokkos::deep_copy(rcnt, 0);
+    Kokkos::parallel_for(
+        "nf::face_roots", Kokkos::RangePolicy<Exec>(space, 0, nf), KOKKOS_LAMBDA(std::size_t f) {
+          if (fpar(f) == std::int64_t(f)) {
+            const int s0 = Kokkos::atomic_fetch_add(&rcnt(), 1);
+            rbuf(s0) = f;
+            pbuf(s0) = fpair(f);
+          }
+        });
+    space.fence();
+    auto hc = Kokkos::create_mirror_view(rcnt);
+    Kokkos::deep_copy(hc, rcnt);
+    auto hr = downloadN(rbuf, std::size_t(hc()));
+    auto hp = downloadN(pbuf, std::size_t(hc()));
+    std::vector<std::size_t> ord(hr.size());
+    for (std::size_t i = 0; i < ord.size(); ++i)
+      ord[i] = i;
+    std::sort(ord.begin(), ord.end(), [&](std::size_t a, std::size_t b) {
+      return hp[a] != hp[b] ? hp[a] < hp[b] : hr[a] < hr[b];
+    });
+    for (auto i : ord) {
+      out.throats.push_back({int(hp[i] >> 32), int(hp[i] & 0x7fffffff)});
+      rootF.push_back(hr[i]);
+    }
+    // (root fid -> slot) sorted by root fid for the device lookup
+    rootSlotKey = rootF;
+    std::sort(rootSlotKey.begin(), rootSlotKey.end());
   }
   const std::size_t nt = out.throats.size();
-  std::vector<std::int64_t> keys(nt);
-  for (std::size_t t = 0; t < nt; ++t)
-    keys[t] = (static_cast<std::int64_t>(out.throats[t].first) << 32) | out.throats[t].second;
+  std::vector<int> slotOf(nt);  // position in rootSlotKey -> throat slot
+  for (std::size_t t = 0; t < nt; ++t) {
+    const auto it = std::lower_bound(rootSlotKey.begin(), rootSlotKey.end(), rootF[t]);
+    slotOf[std::size_t(it - rootSlotKey.begin())] = int(t);
+  }
   Kokkos::View<std::int64_t*, Mem> keyD("nf::keys", nt);
-  uploadVec(keys, keyD);
+  Kokkos::View<int*, Mem> slotD("nf::slots", nt);
+  uploadVec(rootSlotKey, keyD);
+  uploadVec(slotOf, slotD);
 
   // accumulate: openness-weighted MAC face fluxes over every flow-basin boundary face, plus the
   // area-weighted throat centroid (min-imaged relative to the lower pore's center).
@@ -732,22 +899,22 @@ inline NetworkFlow extract_network_flow_k(
               Kokkos::atomic_add(&resid(a - 1), q);
             if (b > 0)
               Kokkos::atomic_add(&resid(b - 1), -q);
-            if (a > 0 && b > 0 && opn > 0.0) {
-              const int lo = a < b ? a : b, hi = a < b ? b : a;
-              const std::int64_t key = (static_cast<std::int64_t>(lo) << 32) | hi;
-              // binary search the sorted throat keys
+            const std::int64_t rt = fpar(3 * std::int64_t(c) + d);  // patch root, -1 = no throat
+            if (rt >= 0) {
+              // binary search the sorted patch roots -> throat slot
               std::int64_t l = 0, hgh = ntl - 1, slot = -1;
               while (l <= hgh) {
                 const std::int64_t mid = l + (hgh - l) / 2;
-                if (keyD(mid) == key) {
-                  slot = mid;
+                if (keyD(mid) == rt) {
+                  slot = slotD(mid);
                   break;
                 }
-                if (keyD(mid) < key)
+                if (keyD(mid) < rt)
                   l = mid + 1;
                 else
                   hgh = mid - 1;
               }
+              const int lo = a < b ? a : b;
               if (slot >= 0) {
                 const double w0 = opn * area;
                 Kokkos::atomic_add(&Q(slot), a < b ? q : -q);

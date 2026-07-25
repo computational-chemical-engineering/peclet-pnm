@@ -1185,49 +1185,537 @@ inline NetworkFlow extract_network_flow_mpi(
   uploadVec(ancY, ancYD);
   uploadVec(ancZ, ancZD);
 
-  // 5. throat keys from owned +faces of the flow-basin field (open faces only), global unique
+  // 5. per-patch throats: distributed CCL over the interface faces. Local union-find on owned
+  // faces (fid = 3*gid(cell)+d, same identity/adjacency as single-rank), per-component min fid,
+  // then ONE global merge of the cross-block face-adjacency graph — the marker-CCL recipe. The
+  // patch root (min global fid) is decomposition-independent, so the throat list matches the
+  // single-rank order exactly.
+  const std::size_t nfL = 3 * nInner;
+  Kokkos::View<Index*, Mem> faceLab("pnm::nfmpi::faceLab", nfL);  // final: patch label (min fid)
+  View<Index> flabE[3], fpairE[3];  // per-direction extended fields for the boundary merge
+  std::vector<Index> keySorted_;    // patch roots sorted (device lookup keys)
+  std::vector<int> slotOf_;         // key position -> throat slot
+  constexpr Index kSent = 0x7ffffffffffffffeLL;  // film awaiting attachment (see single-rank)
   {
     const bool ho = hasOpen;
-    const std::int64_t maxp = std::int64_t(nInner) * 3;
-    Kokkos::View<std::int64_t*, Mem> praw("pnm::nfmpi::praw", std::size_t(maxp));
-    Kokkos::View<int, Mem> pcnt("pnm::nfmpi::prawcnt");
-    Kokkos::deep_copy(pcnt, 0);
+    Kokkos::View<int*, Mem> parent("pnm::nfmpi::fparent", nfL);
+    Kokkos::View<Index*, Mem> fpairL("pnm::nfmpi::fpairL", nfL);
+    Kokkos::View<char*, Mem> fcoreL("pnm::nfmpi::fcoreL", nfL);
+    // interface predicate + CORE tier (both cells fluid-centered — see single-rank rationale)
     Kokkos::parallel_for(
-        "pnm::nfmpi::throat_pairs", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+        "pnm::nfmpi::face_init", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
           const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-          const int a = flowLab(g.lidx(lx, ly, lz));
+          const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+          const Index ce = g.lidx(lx, ly, lz);
+          const int a = flowLab(ce);
           for (int d = 0; d < 3; ++d) {
             const Index nb = g.lidx(lx + (d == 0), ly + (d == 1), lz + (d == 2));
             const int b = flowLab(nb);
-            if (a == b || a <= 0 || b <= 0)
-              continue;
             const double opn = ho ? (d == 0 ? oxE(nb) : (d == 1 ? oyE(nb) : ozE(nb))) : 1.0;
-            if (opn <= 0.0)
-              continue;
-            const int lo = a < b ? a : b, hi = a < b ? b : a;
-            const int s0 = Kokkos::atomic_fetch_add(&pcnt(), 1);
-            if (s0 < maxp)
-              praw(s0) = (std::int64_t(lo) << 32) | hi;
+            const bool itf = (a != b && a > 0 && b > 0 && opn > 0.0);
+            fcoreL(3 * o + d) = (itf && sdfE(ce) > 0.0f && sdfE(nb) > 0.0f) ? 1 : 0;
+            parent(3 * o + d) = fcoreL(3 * o + d) ? int(3 * o + d) : -1;
+            fpairL(3 * o + d) =
+                itf ? ((Index(a < b ? a : b) << 32) | (a < b ? b : a)) : Index(-1);
           }
         });
     space.fence();
-    auto hc = Kokkos::create_mirror_view(pcnt);
-    Kokkos::deep_copy(hc, pcnt);
-    auto loc = downloadN(praw, std::size_t(std::min<std::int64_t>(hc(), maxp)));
+    // local CCL to fixpoint (owned-owned adjacency only; cross-block via the boundary graph)
+    Kokkos::View<int, Mem> changed("pnm::nfmpi::fch");
+    int h_changed = 1;
+    while (h_changed) {
+      Kokkos::deep_copy(changed, 0);
+      Kokkos::parallel_for(
+          "pnm::nfmpi::face_merge", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+            for (int d = 0; d < 3; ++d) {
+              const int f = int(3 * o + d);
+              if (parent(f) < 0)
+                continue;
+              const Index pk = fpairL(f);
+              for (int dz = -1; dz <= 1; ++dz)
+                for (int dy = -1; dy <= 1; ++dy)
+                  for (int dx = -1; dx <= 1; ++dx) {
+                    const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
+                    if (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 || jz >= g.nz)
+                      continue;  // ghost-side faces go through the boundary graph
+                    const Index o2 = (Index(jz) * g.ny + jy) * g.nx + jx;
+                    for (int d2 = 0; d2 < 3; ++d2) {
+                      const int f2 = int(3 * o2 + d2);
+                      if (f2 == f || parent(f2) < 0 || fpairL(f2) != pk)
+                        continue;
+                      const int Dx = 2 * dx + (d2 == 0) - (d == 0);
+                      const int Dy = 2 * dy + (d2 == 1) - (d == 1);
+                      const int Dz = 2 * dz + (d2 == 2) - (d == 2);
+                      if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
+                        continue;
+                      int rm = f;
+                      while (rm != parent(rm))
+                        rm = parent(rm);
+                      int rn = f2;
+                      while (rn != parent(rn))
+                        rn = parent(rn);
+                      if (rm != rn) {
+                        const int sml = rm < rn ? rm : rn, lrg = rm < rn ? rn : rm;
+                        Kokkos::atomic_min(&parent(lrg), sml);
+                        changed() = 1;
+                      }
+                    }
+                  }
+            }
+          });
+      space.fence();
+      Kokkos::parallel_for(
+          "pnm::nfmpi::face_flatten", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
+            int l = parent(f);
+            if (l >= 0) {
+              while (l != parent(l))
+                l = parent(l);
+              parent(f) = int(l);
+            }
+          });
+      space.fence();
+      auto hc = Kokkos::create_mirror_view(changed);
+      Kokkos::deep_copy(hc, changed);
+      h_changed = hc();
+    }
+    // per-component min GLOBAL fid -> the patch label of the local piece
+    Kokkos::View<Index*, Mem> mg("pnm::nfmpi::fmg", nfL);
+    Kokkos::deep_copy(mg, Index(0x7fffffffffffffffLL));
+    Kokkos::parallel_for(
+        "pnm::nfmpi::face_mingid", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+          const Index gid = g.gidAt(ix + 1, iy + 1, iz + 1);
+          for (int d = 0; d < 3; ++d)
+            if (parent(3 * o + d) >= 0)
+              Kokkos::atomic_min(&mg(parent(3 * o + d)), 3 * gid + d);
+        });
+    space.fence();
+    Kokkos::parallel_for(
+        "pnm::nfmpi::face_label", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
+          faceLab(f) =
+              parent(f) >= 0 ? mg(parent(f)) : (fpairL(f) >= 0 ? kSent : Index(-1));
+        });
+    space.fence();
+    // scatter CORE labels (+ pair keys, once) into per-direction extended fields and exchange
+    auto scatterLabels = [&]() {
+      for (int d = 0; d < 3; ++d) {
+        auto fl = flabE[d];
+        const int dd0 = d;
+        Kokkos::parallel_for(
+            "pnm::nfmpi::face_scatter", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+              const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+              const Index lbl = faceLab(3 * o + dd0);
+              fl(g.lidx(ix + 1, iy + 1, iz + 1)) = (lbl >= 0 && lbl < kSent) ? lbl : Index(-1);
+            });
+        space.fence();
+        haloI.exchange(flabE[d]);
+      }
+    };
+    for (int d = 0; d < 3; ++d) {
+      flabE[d] = View<Index>("pnm::nfmpi::flabE", nExt);
+      fpairE[d] = View<Index>("pnm::nfmpi::fpairE", nExt);
+      Kokkos::deep_copy(flabE[d], Index(-1));
+      Kokkos::deep_copy(fpairE[d], Index(-1));
+      auto fq = fpairE[d];
+      const int dd0 = d;
+      Kokkos::parallel_for(
+          "pnm::nfmpi::pair_scatter", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+            fq(g.lidx(ix + 1, iy + 1, iz + 1)) = fpairL(3 * o + dd0);
+          });
+      space.fence();
+      haloI.exchange(fpairE[d]);
+    }
+    scatterLabels();
+    // cross-block adjacency pairs (owned face vs ghost-cell face), allgathered + host union-find
+    const std::int64_t maxbp = std::int64_t(nInner) * 8 + 1024;
+    Kokkos::View<Index*, Mem> bpairs("pnm::nfmpi::fbp", std::size_t(2 * maxbp));
+    Kokkos::View<int, Mem> bcnt("pnm::nfmpi::fbpcnt");
+    Kokkos::deep_copy(bcnt, 0);
+    auto fl0 = flabE[0];
+    auto fl1 = flabE[1];
+    auto fl2 = flabE[2];
+    auto fq0 = fpairE[0];
+    auto fq1 = fpairE[1];
+    auto fq2 = fpairE[2];
+    Kokkos::parallel_for(
+        "pnm::nfmpi::face_bpairs", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+          if (ix > 0 && ix < g.nx - 1 && iy > 0 && iy < g.ny - 1 && iz > 0 && iz < g.nz - 1)
+            return;  // only faces within one cell of a block face can touch a ghost face
+          const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+          for (int d = 0; d < 3; ++d) {
+            const Index myl = faceLab(3 * o + d);
+            if (myl < 0 || myl >= kSent)
+              continue;  // core faces only in this merge tier
+            const Index pk = fpairL(3 * o + d);
+            for (int dz = -1; dz <= 1; ++dz)
+              for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                  const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
+                  const bool ghost =
+                      (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 || jz >= g.nz);
+                  if (!ghost)
+                    continue;
+                  const Index e2 = g.lidx(jx + 1, jy + 1, jz + 1);
+                  for (int d2 = 0; d2 < 3; ++d2) {
+                    const Index ol = d2 == 0 ? fl0(e2) : (d2 == 1 ? fl1(e2) : fl2(e2));
+                    if (ol < 0 || ol == myl)
+                      continue;
+                    const Index oq = d2 == 0 ? fq0(e2) : (d2 == 1 ? fq1(e2) : fq2(e2));
+                    if (oq != pk)
+                      continue;
+                    const int Dx = 2 * dx + (d2 == 0) - (d == 0);
+                    const int Dy = 2 * dy + (d2 == 1) - (d == 1);
+                    const int Dz = 2 * dz + (d2 == 2) - (d == 2);
+                    if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
+                      continue;
+                    const int s0 = Kokkos::atomic_fetch_add(&bcnt(), 1);
+                    if (s0 < maxbp) {
+                      bpairs(2 * s0) = myl < ol ? myl : ol;
+                      bpairs(2 * s0 + 1) = myl < ol ? ol : myl;
+                    }
+                  }
+                }
+          }
+        });
+    space.fence();
+    auto hcb = Kokkos::create_mirror_view(bcnt);
+    Kokkos::deep_copy(hcb, bcnt);
+    auto flat = downloadN(bpairs, std::size_t(2 * std::min<std::int64_t>(hcb(), maxbp)));
+    std::vector<std::pair<Index, Index>> loc(flat.size() / 2);
+    for (std::size_t i = 0; i < loc.size(); ++i)
+      loc[i] = {flat[2 * i], flat[2 * i + 1]};
     std::sort(loc.begin(), loc.end());
     loc.erase(std::unique(loc.begin(), loc.end()), loc.end());
     auto all = dm::allgatherv(loc, comm);
-    std::sort(all.begin(), all.end());
-    all.erase(std::unique(all.begin(), all.end()), all.end());
-    for (auto k : all)
-      out.throats.push_back({int(k >> 32), int(k & 0x7fffffff)});
+    std::map<Index, Index> par;
+    auto find = [&par](Index x) {
+      while (true) {
+        auto it = par.find(x);
+        if (it == par.end() || it->second == x)
+          return x;
+        x = it->second;
+      }
+    };
+    for (const auto& pr : all) {
+      const Index ra = find(pr.first), rb = find(pr.second);
+      if (ra == rb)
+        continue;
+      const Index lo = ra < rb ? ra : rb, hi = ra < rb ? rb : ra;
+      par[hi] = lo;
+      par.emplace(lo, lo);
+    }
+    std::vector<Index> rk, rv;
+    for (const auto& kv : par) {
+      const Index root = find(kv.first);
+      if (root != kv.first) {
+        rk.push_back(kv.first);
+        rv.push_back(root);
+      }
+    }
+    if (!rk.empty()) {
+      View<Index> dk("pnm::nfmpi::frk", rk.size()), dv("pnm::nfmpi::frv", rv.size());
+      uploadVec(rk, dk);
+      uploadVec(rv, dv);
+      const Index nk = Index(rk.size());
+      Kokkos::parallel_for(
+          "pnm::nfmpi::face_remap", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
+            const Index l = faceLab(f);
+            if (l < 0 || l >= kSent)
+              return;
+            const Index k = dm::bsearchKey(dk, nk, l);
+            if (k >= 0)
+              faceLab(f) = dv(k);
+          });
+      space.fence();
+    }
+    // film attachment: min reachable core-patch label, propagated through films across ranks
+    // (scatter+exchange the current labels each sweep; Jacobi min => deterministic fixpoint)
+    {
+      auto fl0 = flabE[0];
+      auto fl1 = flabE[1];
+      auto fl2 = flabE[2];
+      Kokkos::View<int, Mem> changed("pnm::nfmpi::attch");
+      int rounds2 = 0;
+      for (;;) {
+        scatterLabels();
+        Kokkos::deep_copy(changed, 0);
+        Kokkos::parallel_for(
+            "pnm::nfmpi::film_attach", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+              const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+              for (int d = 0; d < 3; ++d) {
+                const Index f = 3 * o + d;
+                if (fcoreL(f) || faceLab(f) < 0)
+                  continue;
+                if (fpairL(f) < 0)
+                  continue;
+                Index best = faceLab(f);
+                const Index pk = fpairL(f);
+                for (int dz = -1; dz <= 1; ++dz)
+                  for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                      const Index e2 = g.lidx(ix + 1 + dx, iy + 1 + dy, iz + 1 + dz);
+                      for (int d2 = 0; d2 < 3; ++d2) {
+                        const Index l2 = d2 == 0 ? fl0(e2) : (d2 == 1 ? fl1(e2) : fl2(e2));
+                        if (l2 < 0 || l2 >= best)
+                          continue;
+                        const Index q2 = d2 == 0 ? fq0(e2) : (d2 == 1 ? fq1(e2) : fq2(e2));
+                        if (q2 != pk)
+                          continue;
+                        const int Dx = 2 * dx + (d2 == 0) - (d == 0);
+                        const int Dy = 2 * dy + (d2 == 1) - (d == 1);
+                        const int Dz = 2 * dz + (d2 == 2) - (d == 2);
+                        if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
+                          continue;
+                        best = l2;
+                      }
+                    }
+                if (best < faceLab(f)) {
+                  faceLab(f) = best;
+                  changed() = 1;
+                }
+              }
+            });
+        space.fence();
+        auto hc2 = Kokkos::create_mirror_view(changed);
+        Kokkos::deep_copy(hc2, changed);
+        if (!dm::allreduceMaxInt(hc2(), comm))
+          break;
+        if (++rounds2 > 100000) {
+          std::fprintf(stderr, "[pnm::mpi] film attachment did not converge\n");
+          MPI_Abort(comm, 4);
+        }
+      }
+    }
+    // leftover films (no core patch reachable anywhere): own patches — local CCL + one boundary
+    // merge, exactly like the core tier but restricted to still-kSent faces
+    {
+      Kokkos::parallel_for(
+          "pnm::nfmpi::leftover_init", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
+            parent(f) = (faceLab(f) == kSent) ? int(f) : -1;
+          });
+      space.fence();
+      int h_changed2 = 1;
+      while (h_changed2) {
+        Kokkos::deep_copy(changed, 0);
+        Kokkos::parallel_for(
+            "pnm::nfmpi::lo_merge", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+              const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+              for (int d = 0; d < 3; ++d) {
+                const int f = int(3 * o + d);
+                if (parent(f) < 0)
+                  continue;
+                const Index pk = fpairL(f);
+                for (int dz = -1; dz <= 1; ++dz)
+                  for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                      const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
+                      if (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 || jz >= g.nz)
+                        continue;
+                      const Index o2 = (Index(jz) * g.ny + jy) * g.nx + jx;
+                      for (int d2 = 0; d2 < 3; ++d2) {
+                        const int f2 = int(3 * o2 + d2);
+                        if (f2 == f || parent(f2) < 0 || fpairL(f2) != pk)
+                          continue;
+                        const int Dx = 2 * dx + (d2 == 0) - (d == 0);
+                        const int Dy = 2 * dy + (d2 == 1) - (d == 1);
+                        const int Dz = 2 * dz + (d2 == 2) - (d == 2);
+                        if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
+                          continue;
+                        int rm = f;
+                        while (rm != parent(rm))
+                          rm = parent(rm);
+                        int rn = f2;
+                        while (rn != parent(rn))
+                          rn = parent(rn);
+                        if (rm != rn) {
+                          const int sml = rm < rn ? rm : rn, lrg = rm < rn ? rn : rm;
+                          Kokkos::atomic_min(&parent(lrg), sml);
+                          changed() = 1;
+                        }
+                      }
+                    }
+              }
+            });
+        space.fence();
+        Kokkos::parallel_for(
+            "pnm::nfmpi::lo_flatten", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
+              int l = parent(f);
+              if (l >= 0) {
+                while (l != parent(l))
+                  l = parent(l);
+                parent(f) = int(l);
+              }
+            });
+        space.fence();
+        auto hc2 = Kokkos::create_mirror_view(changed);
+        Kokkos::deep_copy(hc2, changed);
+        h_changed2 = hc2();
+      }
+      Kokkos::deep_copy(mg, Index(0x7fffffffffffffffLL));
+      Kokkos::parallel_for(
+          "pnm::nfmpi::lo_mingid", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+            const Index gid = g.gidAt(ix + 1, iy + 1, iz + 1);
+            for (int d = 0; d < 3; ++d)
+              if (parent(3 * o + d) >= 0)
+                Kokkos::atomic_min(&mg(parent(3 * o + d)), 3 * gid + d);
+          });
+      space.fence();
+      Kokkos::parallel_for(
+          "pnm::nfmpi::lo_label", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
+            if (faceLab(f) == kSent)
+              faceLab(f) = mg(parent(f));
+          });
+      space.fence();
+      // boundary merge of leftover patches: scatter leftover labels only, exchange, pair, merge
+      for (int d = 0; d < 3; ++d) {
+        auto fl = flabE[d];
+        const int dd0 = d;
+        Kokkos::parallel_for(
+            "pnm::nfmpi::lo_scatter", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+              const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+              fl(g.lidx(ix + 1, iy + 1, iz + 1)) =
+                  (parent(3 * o + dd0) >= 0) ? faceLab(3 * o + dd0) : Index(-1);
+            });
+        space.fence();
+        haloI.exchange(flabE[d]);
+      }
+      auto fl0b = flabE[0];
+      auto fl1b = flabE[1];
+      auto fl2b = flabE[2];
+      Kokkos::deep_copy(bcnt, 0);
+      Kokkos::parallel_for(
+          "pnm::nfmpi::lo_bpairs", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+            if (ix > 0 && ix < g.nx - 1 && iy > 0 && iy < g.ny - 1 && iz > 0 && iz < g.nz - 1)
+              return;
+            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+            for (int d = 0; d < 3; ++d) {
+              if (parent(3 * o + d) < 0)
+                continue;
+              const Index myl = faceLab(3 * o + d);
+              const Index pk = fpairL(3 * o + d);
+              for (int dz = -1; dz <= 1; ++dz)
+                for (int dy = -1; dy <= 1; ++dy)
+                  for (int dx = -1; dx <= 1; ++dx) {
+                    const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
+                    const bool ghost =
+                        (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 || jz >= g.nz);
+                    if (!ghost)
+                      continue;
+                    const Index e2 = g.lidx(jx + 1, jy + 1, jz + 1);
+                    for (int d2 = 0; d2 < 3; ++d2) {
+                      const Index ol = d2 == 0 ? fl0b(e2) : (d2 == 1 ? fl1b(e2) : fl2b(e2));
+                      if (ol < 0 || ol == myl)
+                        continue;
+                      const Index oq = d2 == 0 ? fq0(e2) : (d2 == 1 ? fq1(e2) : fq2(e2));
+                      if (oq != pk)
+                        continue;
+                      const int Dx = 2 * dx + (d2 == 0) - (d == 0);
+                      const int Dy = 2 * dy + (d2 == 1) - (d == 1);
+                      const int Dz = 2 * dz + (d2 == 2) - (d == 2);
+                      if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
+                        continue;
+                      const int s0 = Kokkos::atomic_fetch_add(&bcnt(), 1);
+                      if (s0 < maxbp) {
+                        bpairs(2 * s0) = myl < ol ? myl : ol;
+                        bpairs(2 * s0 + 1) = myl < ol ? ol : myl;
+                      }
+                    }
+                  }
+            }
+          });
+      space.fence();
+      auto hcb2 = Kokkos::create_mirror_view(bcnt);
+      Kokkos::deep_copy(hcb2, bcnt);
+      auto flat2 = downloadN(bpairs, std::size_t(2 * std::min<std::int64_t>(hcb2(), maxbp)));
+      std::vector<std::pair<Index, Index>> loc2(flat2.size() / 2);
+      for (std::size_t i = 0; i < loc2.size(); ++i)
+        loc2[i] = {flat2[2 * i], flat2[2 * i + 1]};
+      std::sort(loc2.begin(), loc2.end());
+      loc2.erase(std::unique(loc2.begin(), loc2.end()), loc2.end());
+      auto all2 = dm::allgatherv(loc2, comm);
+      std::map<Index, Index> par2;
+      auto find2 = [&par2](Index x) {
+        while (true) {
+          auto it = par2.find(x);
+          if (it == par2.end() || it->second == x)
+            return x;
+          x = it->second;
+        }
+      };
+      for (const auto& pr : all2) {
+        const Index ra = find2(pr.first), rb = find2(pr.second);
+        if (ra == rb)
+          continue;
+        const Index lo = ra < rb ? ra : rb, hi = ra < rb ? rb : ra;
+        par2[hi] = lo;
+        par2.emplace(lo, lo);
+      }
+      std::vector<Index> rk2, rv2;
+      for (const auto& kv : par2) {
+        const Index root = find2(kv.first);
+        if (root != kv.first) {
+          rk2.push_back(kv.first);
+          rv2.push_back(root);
+        }
+      }
+      if (!rk2.empty()) {
+        View<Index> dk2("pnm::nfmpi::frk2", rk2.size()), dv2("pnm::nfmpi::frv2", rv2.size());
+        uploadVec(rk2, dk2);
+        uploadVec(rv2, dv2);
+        const Index nk2 = Index(rk2.size());
+        Kokkos::parallel_for(
+            "pnm::nfmpi::lo_remap", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
+              if (parent(f) < 0)
+                return;
+              const Index k = dm::bsearchKey(dk2, nk2, faceLab(f));
+              if (k >= 0)
+                faceLab(f) = dv2(k);
+            });
+        space.fence();
+      }
+    }
+    // global unique (patch root, pair) -> throat list, ordered by (pair, root fid)
+    {
+      auto flabH = downloadN(faceLab, nfL);
+      auto fpairH = downloadN(fpairL, nfL);
+      std::vector<std::pair<Index, Index>> locR;  // (root, pair)
+      for (std::size_t f = 0; f < nfL; ++f)
+        if (flabH[f] >= 0)
+          locR.push_back({flabH[f], fpairH[f]});
+      std::sort(locR.begin(), locR.end());
+      locR.erase(std::unique(locR.begin(), locR.end()), locR.end());
+      auto allR = dm::allgatherv(locR, comm);
+      std::sort(allR.begin(), allR.end());
+      allR.erase(std::unique(allR.begin(), allR.end()), allR.end());
+      std::sort(allR.begin(), allR.end(),
+                [](const std::pair<Index, Index>& x, const std::pair<Index, Index>& y) {
+                  return x.second != y.second ? x.second < y.second : x.first < y.first;
+                });
+      for (const auto& rp : allR)
+        out.throats.push_back({int(rp.second >> 32), int(rp.second & 0x7fffffff)});
+      // (root fid -> slot) sorted by root for the device lookup
+      std::vector<Index> rootF;
+      for (const auto& rp : allR)
+        rootF.push_back(rp.first);
+      std::vector<Index> rootSorted = rootF;
+      std::sort(rootSorted.begin(), rootSorted.end());
+      std::vector<int> slotOf(rootF.size());
+      for (std::size_t t = 0; t < rootF.size(); ++t) {
+        const auto it = std::lower_bound(rootSorted.begin(), rootSorted.end(), rootF[t]);
+        slotOf[std::size_t(it - rootSorted.begin())] = int(t);
+      }
+      keySorted_ = std::move(rootSorted);
+      slotOf_ = std::move(slotOf);
+    }
   }
   const std::size_t nt = out.throats.size();
-  std::vector<std::int64_t> keys(nt);
-  for (std::size_t t = 0; t < nt; ++t)
-    keys[t] = (std::int64_t(out.throats[t].first) << 32) | out.throats[t].second;
-  Kokkos::View<std::int64_t*, Mem> keyD("pnm::nfmpi::keys", nt);
-  uploadVec(keys, keyD);
+  Kokkos::View<Index*, Mem> keyD("pnm::nfmpi::keys", nt);
+  Kokkos::View<int*, Mem> slotD("pnm::nfmpi::slots", nt);
+  uploadVec(keySorted_, keyD);
+  uploadVec(slotOf_, slotD);
 
   // 6. rank-local accumulation over owned +faces, then a global sum-reduce
   std::vector<double> Qh(nt, 0.0), Ah(nt, 0.0), Cxh(nt, 0.0), Cyh(nt, 0.0), Czh(nt, 0.0),
@@ -1259,21 +1747,22 @@ inline NetworkFlow extract_network_flow_mpi(
               Kokkos::atomic_add(&resid(a - 1), q);
             if (b > 0)
               Kokkos::atomic_add(&resid(b - 1), -q);
-            if (a > 0 && b > 0 && opn > 0.0) {
-              const int lo = a < b ? a : b, hi = a < b ? b : a;
-              const std::int64_t key = (std::int64_t(lo) << 32) | hi;
+            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+            const Index rt = faceLab(3 * o + d);  // patch root, -1 = no throat face
+            if (rt >= 0) {
               std::int64_t l = 0, hgh = ntl - 1, slot = -1;
               while (l <= hgh) {
                 const std::int64_t mid = l + (hgh - l) / 2;
-                if (keyD(mid) == key) {
-                  slot = mid;
+                if (keyD(mid) == rt) {
+                  slot = slotD(mid);
                   break;
                 }
-                if (keyD(mid) < key)
+                if (keyD(mid) < rt)
                   l = mid + 1;
                 else
                   hgh = mid - 1;
               }
+              const int lo = a < b ? a : b;
               if (slot >= 0) {
                 const double w0 = opn * area;
                 Kokkos::atomic_add(&Q(slot), a < b ? q : -q);

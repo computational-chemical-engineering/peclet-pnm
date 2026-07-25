@@ -204,8 +204,9 @@ NB_MODULE(_pnm, m) {
       "omit ox/oy/oz for a fully open grid. grad_p_zyx adds the macroscopic gradient along the "
       "min-image pore-to-pore vector to throat_dp (= P_i - P_j, drives flow i->j when positive). "
       "pore_residual is the signed flux sum over each pore's whole boundary — ~solver tolerance "
-      "when u is flow's projected divergence-free field. NOTE: throats are keyed by label pair; "
-      "disjoint parallel interfaces between the same two pores merge (fluxes add).");
+      "when u is flow's projected divergence-free field. Throats are PER-PATCH (a connected patch "
+      "of interface faces): two disjoint interfaces between the same two pores are separate "
+      "parallel throats, so the throat list can repeat a label pair.");
 
 #ifdef PECLET_PNM_MPI
   // Distributed path (built with -DPECLET_PNM_MPI=ON): the SDF is decomposed over ranks by the

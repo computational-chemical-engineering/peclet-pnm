@@ -186,6 +186,69 @@ check("case3 g>0 on all throats", bool(np.all(Q3 * dp3 > 0)),
 check("case3 flux agrees with cut-cell IBM", abs(F3 - F) < 0.10 * abs(F),
       f"rel diff {(F3-F)/F:.2%} (coarse tube: r = 4 cells)")
 
+# ================= case 4: PARALLEL throats (per-patch resolution) =============================
+# Two chambers connected by TWO capsule tubes of different radii (same pore pair, two disjoint
+# interfaces -> two parallel throats) + a wrap tube as the return path. Pair-keyed throats would
+# merge the capsules into one entry; per-patch must report pair (1,2) twice, with Q_A + Q_B = F
+# and the fatter capsule carrying more.
+print("\n=== case 4: parallel capsule throats ===")
+del s
+NX4, NY4, NZ4 = 48, 32, 32
+x, y, z = np.meshgrid(*(np.arange(d, dtype=np.float64) for d in (NX4, NY4, NZ4)), indexing="ij")
+sdf4 = np.full((NX4, NY4, NZ4), -1e30)
+for cx in (12.0, 36.0):  # chambers
+    dx = np.abs(x - cx); dx = np.minimum(dx, NX4 - dx)
+    sdf4 = np.maximum(sdf4, 8.0 - np.sqrt(dx**2 + (y - 16.0) ** 2 + (z - 16.0) ** 2))
+# capsule ridges must DRAIN into the chamber basins (no own pore): needs chamber sdf >= r one
+# cell off the ridge at the junction, i.e. 8 - |16-cy| + 1 >= r — hence cy near the axis.
+for (cy, rt) in ((12.0, 3.0), (20.0, 4.2)):  # capsules between the chambers (no wrap)
+    xs = np.clip(x, 12.0, 36.0)
+    sdf4 = np.maximum(sdf4, rt - np.sqrt((x - xs) ** 2 + (y - cy) ** 2 + (z - 16.0) ** 2))
+xw = np.where(x < 12.0, x + NX4, x)  # wrap capsule: the return path, own pore at the gid seam
+xs = np.clip(xw, 36.0, 12.0 + NX4)
+sdf4 = np.maximum(sdf4, 4.0 - np.sqrt((xw - xs) ** 2 + (y - 16.0) ** 2 + (z - 16.0) ** 2))
+
+s = peclet.flow.Solver(NX4, NY4, NZ4)
+s.set_rho(1.0); s.set_mu(MU); s.set_dt(100.0)
+s.set_body_force(FX, 0.0, 0.0)
+s.set_solid(np.asfortranarray(sdf4), cutcell_pressure=True)
+for _ in range(60):
+    s.step()
+u, v, w, p = s.get_uf(), s.get_vf(), s.get_wf(), s.get_p()
+ox, oy, oz = s.get_ox(), s.get_oy(), s.get_oz()
+F4 = np.array([(ox[i, :, :] * u[i, :, :]).sum() for i in range(NX4)]).mean()
+net4 = pnm.extract_network_flow(
+    np.ascontiguousarray(sdf4.T, dtype=np.float32), [0.0, 0.0, 0.0], [1.0, 1.0, 1.0],
+    np.ascontiguousarray(u.T), np.ascontiguousarray(v.T), np.ascontiguousarray(w.T),
+    np.ascontiguousarray(p.T), np.ascontiguousarray(ox.T), np.ascontiguousarray(oy.T),
+    np.ascontiguousarray(oz.T), grad_p_zyx=[0.0, 0.0, -FX])
+Q4 = np.array(net4["throat_flow"])
+dp4 = np.array(net4["throat_dp"])
+res4 = np.array(net4["pore_residual"])
+th4 = net4["throats"]
+print(f"pores {len(net4['pores'])}, throats {len(Q4)}, F = {F4:.4e}")
+for t, (a, b) in enumerate(th4):
+    print(f"  throat {a}-{b}: Q={Q4[t]: .6e} dp={dp4[t]: .4e} A={net4['throat_area'][t]:7.2f}")
+par = [t for t, ab in enumerate(th4) if ab == (1, 2)]
+check("case4 pore count", len(net4["pores"]) == 3, f"{len(net4['pores'])} (2 chambers + wrap pore)")
+check("case4 parallel pair (1,2) twice", len(par) == 2,
+      f"pair (1,2) appears {len(par)}x of {len(Q4)} throats")
+check("case4 mass residuals", np.abs(res4).max() < 1e-4 * abs(F4),
+      f"max |residual|/F = {np.abs(res4).max()/abs(F4):.2e}")
+if len(par) == 2:
+    qA, qB = Q4[par[0]], Q4[par[1]]
+    check("case4 parallel split sums to F", abs(qA + qB - F4) < 1e-3 * abs(F4),
+          f"Q_A + Q_B = {qA+qB:.6e} vs F = {F4:.6e}")
+    check("case4 both capsules carry forward flow", qA > 0 and qB > 0,
+          f"Q_A = {qA:.3e}, Q_B = {qB:.3e}")
+    check("case4 fatter capsule carries more", max(qA, qB) > 1.5 * min(qA, qB),
+          f"ratio {max(qA,qB)/min(qA,qB):.2f} (radii 4.5 vs 3)")
+wrapT = [t for t, ab in enumerate(th4) if ab != (1, 2)]
+check("case4 wrap throats carry F", bool(np.all(np.abs(np.abs(Q4[wrapT]) - abs(F4)) < 1e-3 * abs(F4))),
+      f"|Q| = {np.abs(Q4[wrapT]).tolist()}")
+check("case4 g>0 on all throats", bool(np.all(Q4 * dp4 > 0)),
+      f"signs: {np.sign(Q4*dp4).astype(int).tolist()}")
+
 print("PASS" if fails == 0 else f"FAIL ({fails})")
 del s  # release the solver's device Views BEFORE interpreter exit (flow's finalize contract)
 sys.exit(1 if fails else 0)

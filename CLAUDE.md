@@ -37,7 +37,11 @@ is pure C++. Part of the peclet suite (see `../CLAUDE.md` and `../docs/` for sui
   every rank. GOTCHA: periodic-image decisions (face min-image + the throat dp image count) MUST
   anchor on integer peak-voxel coords / snapped-integer arithmetic — float-centroid anchoring
   flips images at exactly L/2 under CUDA FMA wobble (measured flaky np4 failures on symmetric
-  lattices).
+  lattices). THROATS ARE PER-PATCH (parallel throats resolved): face-CCL keyed by min global
+  face id (fid = 3*gid+d); CORE tier = both cells FLUID-centered (an OPENNESS threshold cannot
+  separate throats bridged by wall films — staircase faces reach opn ~0.7; the fluid-centered
+  criterion is geometric and parameter-free); films attach to the min reachable core patch by
+  Jacobi min-propagation (cannot bridge two cores), unreachable films form their own patches.
 - `pore_extraction_mpi.hpp` — the **distributed** pipeline (gated `PECLET_PNM_MPI`): core ORB
   decomposition + g=1 `GridHalo` exchange; labels are GLOBAL voxel ids so every fixpoint is
   decomposition-independent → **bit-exact to single-rank**. Stage design: local union-find CCL +

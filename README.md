@@ -98,10 +98,16 @@ Validated in `scripts/verify_network_flow.py` (chamber-tube chain + asymmetric t
 the ghost-IBM chain, DNS by peclet.flow): every throat carries the DNS flux to ~1e-11 relative
 (cut-cell), residuals ~1e-12·F, g = Q/dp > 0 on all throats, and the dp sum around each loop
 equals the macroscopic drop.
-`scripts/demo_network_flow_packing.py` runs the pipeline on a real sphere packing. Caveats: two
-disjoint interfaces between the same two pores merge (pair-keyed throats); on loose packings
-(porosity ≳ 0.6) intra-pore pressure variation is comparable to throat drops, so per-throat
-g = Q/dp scatters — a property of the point-pressure PNM abstraction, not of the extraction.
+`scripts/demo_network_flow_packing.py` runs the pipeline on a real sphere packing.
+
+**Throats are per-patch:** a throat is a *connected patch* of interface faces (CCL over the
+interface, core faces = both cells fluid-centered, wall-film faces attached by propagation), so
+two disjoint interfaces between the same two pores — e.g. two parallel tubes, or a direct contact
+plus one through the periodic wrap — are separate parallel throats and the throat list can repeat
+a pore pair (validated: two capsules of different radii report two (1,2) throats whose fluxes sum
+to the DNS flux exactly). Remaining caveat: on loose packings (porosity ≳ 0.6) intra-pore
+pressure variation is comparable to throat drops, so per-throat g = Q/dp scatters — a property of
+the point-pressure PNM abstraction, not of the extraction.
 
 ## Distributed (MPI) extraction
 
