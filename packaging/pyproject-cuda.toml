@@ -1,0 +1,42 @@
+# CUDA (single-GPU) packaging variant of peclet-pnm, published to PyPI as `peclet-pnm-cu13`.
+#
+# Same source/CMake as the CPU peclet-pnm, but: (1) built against a CUDA Kokkos prefix
+# (CMAKE_PREFIX_PATH -> extern/install/nvidia-cuda, bootstrapped in the release workflow's cuda job --
+# Kokkos is static, so it is embedded in the module), (2) libcudart is NOT bundled but supplied by the
+# `nvidia-cuda-runtime` dependency wheel, reached via the module RPATH set by
+# -DPECLET_CUDA_RUNTIME_WHEEL=ON. Installs the SAME `peclet.pnm` import; it is mutually exclusive with
+# the CPU `peclet-pnm` (the CuPy `cupy` vs `cupy-cuda12x` model). AMD/HIP + multi-GPU MPI stay
+# source/container builds. Mirrors flow/packaging/pyproject-cuda.toml (peclet-flow-cu13).
+#
+# The release workflow copies this over pyproject.toml for the cuda-wheel job; keep it in lockstep with
+# ../pyproject.toml (only name / dependencies / the CUDA cmake.define differ).
+
+[build-system]
+requires = ["scikit-build-core>=0.8", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "peclet-pnm-cu13"
+version = "0.1.0"
+description = "peclet.pnm (CUDA / single-GPU) — Kokkos pore-network extraction from SDF geometry (pores, watershed segmentation, throat topology)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Frank Peters", email = "e.a.j.f.peters@gmail.com" }]
+# libcudart.so.13 from the CUDA-13 runtime wheel (NVIDIA dropped the -cuXX suffix at CUDA 13:
+# `nvidia-cuda-runtime`, not `-cu13`). libcuda.so.1 (the driver) is host-provided, never a wheel.
+dependencies = ["numpy>=1.20", "nvidia-cuda-runtime>=13,<14"]
+
+[project.urls]
+Homepage = "https://github.com/computational-chemical-engineering/peclet"
+Documentation = "https://github.com/computational-chemical-engineering/peclet"
+Source = "https://github.com/computational-chemical-engineering/peclet-pnm"
+
+[tool.scikit-build]
+minimum-version = "0.8"
+cmake.version = ">=3.24"
+wheel.install-dir = "."
+wheel.packages = []
+cmake.define.PECLET_CUDA_RUNTIME_WHEEL = "ON"
+sdist.include = ["src", "packaging", "cmake", "CMakeLists.txt", "README.md", "LICENSE"]

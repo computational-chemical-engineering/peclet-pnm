@@ -1,10 +1,14 @@
 name: Release
 
-# Build + publish peclet-pnm to PyPI on a version tag: sdist + self-contained OpenMP CPU wheels
-# (FetchContent Kokkos OpenMP+Serial, PECLET_VENDOR_DEPS=ON from [tool.cibuildwheel]).
-# Uses PyPI Trusted Publishing (OIDC): register this workflow as the publisher for `peclet-pnm` on
-# PyPI first — no API token secret needed. (A CUDA wheel variant à la peclet-flow-cu13 can be added
-# later; the CMake rpath hook PECLET_CUDA_RUNTIME_WHEEL is already in place.)
+# Build + publish to PyPI on a version tag:
+#   * peclet-pnm      — sdist + self-contained OpenMP CPU wheels (FetchContent Kokkos OpenMP+Serial,
+#                       PECLET_VENDOR_DEPS=ON from [tool.cibuildwheel]).
+#   * peclet-pnm-cu13 — single-GPU CUDA wheels (cuda-wheel job): Kokkos-CUDA (static, embedded) built
+#                       against CUDA 13; libcudart comes from the `nvidia-cuda-runtime` dependency wheel
+#                       (rpath, -DPECLET_CUDA_RUNTIME_WHEEL=ON), not bundled. HIP + multi-GPU MPI stay
+#                       source/container.
+# Uses PyPI Trusted Publishing (OIDC): register the publisher for BOTH `peclet-pnm` AND `peclet-pnm-cu13`
+# on PyPI first (one publisher per project) — no API token secret needed.
 
 on:
   push:
@@ -39,8 +43,79 @@ jobs:
           name: wheels-linux
           path: wheelhouse/*.whl
 
+  # peclet-pnm-cu13: single-GPU CUDA wheels. Runs in a manylinux_2_28 container (so the output is a
+  # PyPI-uploadable manylinux wheel), installs the CUDA toolkit, builds a Kokkos-CUDA prefix ONCE, then
+  # builds + repairs the pnm wheel for each supported CPython. libcudart is NOT bundled — it is supplied
+  # by the `nvidia-cuda-runtime` runtime wheel (declared in packaging/pyproject-cuda.toml) and reached via
+  # the module rpath baked by -DPECLET_CUDA_RUNTIME_WHEEL=ON. Mirrors peclet-flow's cuda-wheel job.
+  cuda-wheel:
+    name: cuda wheels (peclet-pnm-cu13, manylinux_2_28 x86_64)
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      KOKKOS_TAG: "5.1.1"
+      # SASS baseline = the lowest arch the pinned CUDA supports; PTX carries the fatbin forward to newer
+      # GPUs by JIT (so one wheel runs Turing..Blackwell). Bump/extend if the CUDA floor moves. (KOKKOS_ARCH
+      # name must match CUDA_ARCH number: TURING75/75, AMPERE80/80, HOPPER90/90, BLACKWELL120/120.)
+      KOKKOS_ARCH: "TURING75"
+      CUDA_ARCH: "75"
+      CUDA_PKG: "13-2"          # CUDA toolkit package suffix (cuda-nvcc-13-2 …)
+      CUDA_HOME: "/usr/local/cuda-13.2"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install CUDA toolkit (nvcc + cudart devel)
+        run: |
+          dnf -y install dnf-plugins-core
+          dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+          dnf -y install cuda-nvcc-${CUDA_PKG} cuda-cudart-devel-${CUDA_PKG} cuda-crt-${CUDA_PKG} cuda-nvml-devel-${CUDA_PKG} cuda-driver-devel-${CUDA_PKG}
+          echo "${CUDA_HOME}/bin" >> "$GITHUB_PATH"
+
+      - name: Build Kokkos-CUDA prefix (static; embedded in the module)
+        run: |
+          export PATH="${CUDA_HOME}/bin:$PATH"
+          git clone --depth 1 --branch "${KOKKOS_TAG}" https://github.com/kokkos/kokkos.git /tmp/kokkos
+          cmake -S /tmp/kokkos -B /tmp/kokkos/build \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/kokkos-cuda" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20 -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_CXX_COMPILER=/tmp/kokkos/bin/nvcc_wrapper \
+            -DKokkos_ENABLE_CUDA=ON -DKokkos_ENABLE_SERIAL=ON \
+            "-DKokkos_ARCH_${KOKKOS_ARCH}=ON" -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"
+          cmake --build /tmp/kokkos/build --target install -j
+
+      - name: Build + repair CUDA wheels (cp310–cp313)
+        run: |
+          export PATH="${CUDA_HOME}/bin:$PATH"
+          export CMAKE_PREFIX_PATH="${GITHUB_WORKSPACE}/kokkos-cuda"
+          cp packaging/pyproject-cuda.toml pyproject.toml   # -> peclet-pnm-cu13 + nvidia-cuda-runtime dep
+          mkdir -p /tmp/raw /tmp/out
+          for PY in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313; do
+            "/opt/python/${PY}/bin/pip" wheel . --no-deps -w /tmp/raw
+          done
+          # Retag to manylinux (libcudart/libcuda are external: excluded), then re-add the nvidia rpath
+          # auditwheel resets, so `import peclet.pnm` finds libcudart in the nvidia-cuda-runtime wheel.
+          /opt/python/cp312-cp312/bin/pip install -q auditwheel wheel
+          for whl in /tmp/raw/*.whl; do
+            /opt/python/cp312-cp312/bin/auditwheel repair \
+              --exclude libcudart.so.13 --exclude libcuda.so.1 \
+              --plat manylinux_2_28_x86_64 -w /tmp/rep "$whl"
+          done
+          for whl in /tmp/rep/*.whl; do
+            work=$(mktemp -d)
+            ( cd "$work" && /opt/python/cp312-cp312/bin/python -m wheel unpack "$whl" )
+            pkg=$(ls -d "$work"/*/)
+            patchelf --add-rpath '$ORIGIN/../../nvidia/cu13/lib'    "$pkg"peclet/pnm/_pnm*.so
+            ( cd "$work" && /opt/python/cp312-cp312/bin/python -m wheel pack "$pkg" -d /tmp/out )
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cuda
+          path: /tmp/out/*.whl
+
   publish:
-    needs: [sdist, wheels]
+    needs: [sdist, wheels, cuda-wheel]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     environment: pypi
@@ -51,6 +126,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # Uploads both peclet-pnm (sdist + CPU wheels) and peclet-pnm-cu13 (CUDA wheels); PyPI routes each
+      # file by its metadata name. Both projects must have this workflow registered as a trusted publisher.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          skip-existing: true
+          skip-existing: true   # completing a partial upload (e.g. adding the cu13 files) must not
+                                # fail on the already-published peclet-pnm files
