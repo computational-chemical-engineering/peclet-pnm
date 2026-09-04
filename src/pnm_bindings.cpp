@@ -6,6 +6,12 @@
 /// is the Kokkos GPU port. Exposes `SDFReader`, `extract_pores`, `segment_volume`,
 /// `extract_topology_gpu`. A C-order (Nz,Ny,Nx) buffer is contiguous x-fastest, so it maps onto the
 /// solver's flat layout directly via the shared bridge (peclet::core::python, core).
+///
+/// Kokkos teardown follows the suite-wide pattern of peclet/core/python/kokkos_teardown.hpp: Kokkos
+/// is initialized at import and the module's single atexit hook (also `pnm.finalize()`) releases
+/// every registered View owner and THEN calls Kokkos::finalize. pnm keeps no Kokkos state between
+/// calls (its registry stays empty), but the finalize is still REQUIRED on CUDA (else
+/// cudaErrorCudartUnloading at exit).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>  // optional openness arrays (extract_network_flow)
@@ -19,6 +25,7 @@
 #include <Kokkos_Core.hpp>
 #include <vector>
 
+#include "peclet/core/python/kokkos_teardown.hpp"
 #include "peclet/core/python/ndarray_interop.hpp"
 #include "pore_extraction.hpp"
 #include "sdf_reader.h"
@@ -72,16 +79,11 @@ static std::vector<double> to_field(nb::ndarray<double, nb::c_contig> a,
 
 NB_MODULE(_pnm, m) {
   m.attr("__doc__") = "pnm — pore-network extraction from SDF geometry (Kokkos)";
-  if (!Kokkos::is_initialized())
-    Kokkos::initialize();
-  // atexit Kokkos::finalize is REQUIRED on CUDA (else cudaErrorCudartUnloading at exit when
-  // Kokkos's device state outlives the CUDA runtime). pnm returns host-vector-backed arrays, so
-  // finalize is always clean here. See peclet-flow's flow_bindings.cpp.
-  nb::module_::import_("atexit").attr("register")(nb::cpp_function([]() {
-    if (Kokkos::is_initialized() && !Kokkos::is_finalized())
-      Kokkos::finalize();
-  }));
-  m.attr("execution_space") = nb::str(Kokkos::DefaultExecutionSpace::name());
+  // Kokkos init + the release-then-finalize atexit hook + finalize() + execution_space: the
+  // suite-wide teardown pattern (peclet/core/python/kokkos_teardown.hpp). pnm's functions hold no
+  // Kokkos state between calls and return host-vector-backed arrays, so its registry stays empty;
+  // the atexit Kokkos::finalize is still REQUIRED on CUDA (else cudaErrorCudartUnloading at exit).
+  peclet::core::python::install(m);
 
   // VTI reader (pure C++; sdf_reader.cpp). Returns (sdf_3d[nz,ny,nx], origin_zyx, spacing_zyx).
   nb::class_<SDFReader>(m, "SDFReader")
