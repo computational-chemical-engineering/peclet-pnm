@@ -4,7 +4,7 @@
 
 #---- project -------------------------------------------------------------------------------------
 PROJECT_NAME           = "pnm"
-PROJECT_NUMBER         = 0.1.0
+PROJECT_NUMBER         = 0.1.1
 PROJECT_BRIEF          = "peclet.pnm — pore-network extraction from SDF geometry (Kokkos)"
 OUTPUT_DIRECTORY       = docs
 HTML_OUTPUT            = html
