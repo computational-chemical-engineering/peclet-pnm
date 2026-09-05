@@ -55,13 +55,20 @@ jobs:
       image: quay.io/pypa/manylinux_2_28_x86_64
     env:
       KOKKOS_TAG: "5.1.1"
-      # SASS baseline = the lowest arch the pinned CUDA supports; PTX carries the fatbin forward to newer
-      # GPUs by JIT (so one wheel runs Turing..Blackwell). Bump/extend if the CUDA floor moves. (KOKKOS_ARCH
-      # name must match CUDA_ARCH number: TURING75/75, AMPERE80/80, HOPPER90/90, BLACKWELL120/120.)
+      # Kokkos is configured for the SASS baseline (Turing, sm_75: the lowest arch CUDA 13 supports) and
+      # nvcc additionally embeds native SASS for every later major (Ampere 80, Hopper 90, Blackwell 100 and
+      # 120) through NVCC_APPEND_FLAGS — nvcc reads that variable itself, so it bypasses nvcc_wrapper, which
+      # rejects a second -arch/-gencode. The compute_75 PTX stays in the fatbin for architectures newer
+      # than the list. Measured 2026-09-06: PTX alone does NOT carry a wheel forward — a driver older than
+      # the toolkit that emitted the PTX cannot JIT it, and under minor-version compatibility the launch
+      # silently does nothing (Kokkos then aborts with "likely mismatch of architecture"). Hence also the
+      # OLDEST 13.x toolkit below, so the PTX JITs on every 13.x driver. (KOKKOS_ARCH name must match
+      # CUDA_ARCH number: TURING75/75, AMPERE80/80, HOPPER90/90, BLACKWELL120/120.)
       KOKKOS_ARCH: "TURING75"
       CUDA_ARCH: "75"
-      CUDA_PKG: "13-2"          # CUDA toolkit package suffix (cuda-nvcc-13-2 …)
-      CUDA_HOME: "/usr/local/cuda-13.2"
+      NVCC_APPEND_FLAGS: "-gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100 -gencode arch=compute_120,code=sm_120"
+      CUDA_PKG: "13-0"          # CUDA toolkit package suffix (cuda-nvcc-13-0 …) — the oldest 13.x, see above
+      CUDA_HOME: "/usr/local/cuda-13.0"
     steps:
       - uses: actions/checkout@v7
 
