@@ -47,8 +47,11 @@ jobs:
 
       - name: Build the pnm module
         run: |
+          # main builds against core's main (the vendored default PECLET_TPX_TAG is the last core
+          # release, which lags the headers main already uses; the release repins it).
           cmake -S . -B build \
-            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/kokkos-install"
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/kokkos-install" \
+            -DPECLET_TPX_TAG=main
           cmake --build build -j
 
       - name: Extraction smoke test (synthetic sphere-lattice SDF)
