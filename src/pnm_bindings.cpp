@@ -156,7 +156,17 @@ NB_MODULE(_pnm, m) {
       },
       nb::arg("sdf"), nb::arg("origin_zyx"), nb::arg("spacing_zyx"),
       "Fused extraction (SDF uploaded once, segmentation device-resident across stages): returns "
-      "(pores, segmentation_flat, connections).");
+      "(pores, segmentation_flat, connections).\n\n"
+      "UNITS: everything is in the system `origin_zyx` / `spacing_zyx` and the SDF are stated in "
+      "(the VTI's own, straight from SDFReader.read_vti) — pore centres are physical coordinates "
+      "and a pore radius is the physical inscribed radius, not a voxel count. Pass "
+      "spacing_zyx = [1,1,1] and origin_zyx = [0,0,0] to work in voxels. Measured on "
+      "flow/data/packing_ring.vti: doubling the spacing, the origin and the SDF together leaves "
+      "the pore count (7199) and the throat-connection count (53020) unchanged and doubles every "
+      "radius BITWISE. One sub-voxel caveat: the centre's intra-cell offset is guarded by an "
+      "absolute `sw > 1e-6` on a squared-distance weight sum, so a near-degenerate peak's centre "
+      "can shift by a fraction of a cell (measured up to 0.37 cells) under a change of unit "
+      "system. Radii, counts and topology are unaffected.");
 
   // Network flow: throat flow rates + pore-center pressures from a peclet.flow MAC field (the
   // method transferred from the Voronoi PNM). Pass flow's fields transposed to (Nz,Ny,Nx):
