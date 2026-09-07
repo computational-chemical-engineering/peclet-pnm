@@ -1,11 +1,19 @@
 /// @file
 /// @brief nanobind module `pnm` — Kokkos pore-network extraction from SDF geometry.
 ///
-/// Matches the numpy convention: SDF is (Nz,Ny,Nx) C-order, origin/spacing are zyx. VTI reading
-/// (SDFReader) is pure C++ (sdf_reader.cpp, backend-free); the pore/segmentation/topology compute
-/// is the Kokkos GPU port. Exposes `SDFReader`, `extract_pores`, `segment_volume`,
-/// `extract_topology_gpu`. A C-order (Nz,Ny,Nx) buffer is contiguous x-fastest, so it maps onto the
-/// solver's flat layout directly via the shared bridge (peclet::core::python, core).
+/// Matches the numpy convention: SDF is (Nz,Ny,Nx) C-order, and every triple that describes it
+/// (`origin_zyx`, `spacing_zyx`, `shape_zyx`, `grad_p_zyx`) is stated in that order and carries the
+/// `_zyx` suffix (NAMING.md §1.7). VTI reading (SDFReader) is pure C++ (sdf_reader.cpp,
+/// backend-free); the pore / segmentation / topology / network-flow compute is Kokkos (any
+/// backend). Exposes `SDFReader`, `Pore`, `extract_pores`, `segment_volume`, `extract_topology`,
+/// `extract_pore_network`, `extract_network_flow` (+ `mpi_*` and the `*_mpi` collectives when
+/// built with PECLET_PNM_MPI). A C-order (Nz,Ny,Nx) buffer is contiguous x-fastest, so it maps
+/// onto the flat layout directly via the shared bridge (peclet::core::python, core).
+///
+/// Precision policy: the SDF is float32 (the VTI's storage type; the kernels compute in float),
+/// `origin_zyx` / `spacing_zyx` are taken as Python floats (double) and NARROWED to float32 before
+/// the kernels, so pore centres and radii are float32 in the input unit system; the MAC fields of
+/// the network-flow extraction (u, v, w, p, openness) are float64 and the flow sums are double.
 ///
 /// Kokkos teardown follows the suite-wide pattern of peclet/core/python/kokkos_teardown.hpp: Kokkos
 /// is initialized at import and the module's single atexit hook (also `pnm.finalize()`) releases
@@ -21,6 +29,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <Kokkos_Core.hpp>
 #include <vector>
@@ -78,7 +87,14 @@ static std::vector<double> to_field(nb::ndarray<double, nb::c_contig> a,
 }
 
 NB_MODULE(_pnm, m) {
-  m.attr("__doc__") = "pnm — pore-network extraction from SDF geometry (Kokkos)";
+  m.attr("__doc__") =
+      "pnm — pore-network extraction from SDF geometry (Kokkos).\n\n"
+      "Arrays are (Nz,Ny,Nx) C-order and every describing triple is z-y-x with a `_zyx` suffix. "
+      "Precision: the SDF is float32 and the geometry kernels compute in float32; origin_zyx / "
+      "spacing_zyx are doubles narrowed to float32 (pore centres and radii are float32 in the "
+      "input "
+      "unit system); the network-flow MAC fields (u, v, w, p, ox, oy, oz) are float64 and their "
+      "sums are double. SDF sign: negative inside the solid, positive in the pore space.";
   // Kokkos init + the release-then-finalize atexit hook + finalize() + execution_space: the
   // suite-wide teardown pattern (peclet/core/python/kokkos_teardown.hpp). pnm's functions hold no
   // Kokkos state between calls and return host-vector-backed arrays, so its registry stays empty;
@@ -103,11 +119,28 @@ NB_MODULE(_pnm, m) {
           },
           "Reads VTI; returns (sdf_3d[nz,ny,nx], origin_zyx, spacing_zyx)");
 
-  nb::class_<Pore>(m, "Pore")
-      .def_rw("x", &Pore::x)
-      .def_rw("y", &Pore::y)
-      .def_rw("z", &Pore::z)
-      .def_rw("radius", &Pore::radius);
+  nb::class_<Pore>(m, "Pore",
+                   "One detected pore: a strict local maximum of the SDF over its 26-neighbourhood "
+                   "(periodic in all three directions). The centre is the peak voxel's position "
+                   "plus a squared-SDF-weighted sub-voxel offset over the 3x3x3 stencil, in the "
+                   "unit system of origin_zyx / spacing_zyx; the radius is the SDF value at the "
+                   "peak, i.e. the physical inscribed-sphere radius. All fields are float32.")
+      .def(nb::init<>())
+      .def(
+          "__init__",
+          [](Pore* p, float x, float y, float z, float radius) { new (p) Pore{x, y, z, radius}; },
+          nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("radius"))
+      .def_rw("x", &Pore::x, "Centre x coordinate (physical units of origin_zyx / spacing_zyx).")
+      .def_rw("y", &Pore::y, "Centre y coordinate.")
+      .def_rw("z", &Pore::z, "Centre z coordinate.")
+      .def_rw("radius", &Pore::radius,
+              "Inscribed-sphere radius = the SDF value at the peak voxel (physical units).")
+      .def("__repr__", [](const Pore& p) {
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "Pore(x=%g, y=%g, z=%g, radius=%g)", (double)p.x,
+                      (double)p.y, (double)p.z, (double)p.radius);
+        return std::string(buf);
+      });
 
   m.def(
       "extract_pores",
@@ -120,7 +153,13 @@ NB_MODULE(_pnm, m) {
                                  (float)spacing_zyx[0]};
         return pnm::extract_pores_k(v, res, org, spc);
       },
-      nb::arg("sdf"), nb::arg("origin_zyx"), nb::arg("spacing_zyx"));
+      nb::arg("sdf"), nb::arg("origin_zyx"), nb::arg("spacing_zyx"),
+      "Pore detection: every voxel with sdf > 0 that is a strict local maximum of the SDF over its "
+      "26 neighbours (periodic wrap in x, y, z; ties broken towards the higher flat index) becomes "
+      "a Pore. sdf is a float32 (Nz,Ny,Nx) C-order array; origin_zyx / spacing_zyx are the grid's "
+      "z-y-x origin and cell size (narrowed to float32). Returns the list of Pore(x, y, z, radius) "
+      "in the input unit system, in device-completion order (NOT sorted; sort by (z, y, x) for a "
+      "reproducible order). Capped at 1e6 pores.");
 
   m.def(
       "segment_volume",
@@ -131,15 +170,34 @@ NB_MODULE(_pnm, m) {
                                  (float)spacing_zyx[0]};
         return pnm::segment_volume_k(v, res, spc);
       },
-      nb::arg("sdf"), nb::arg("spacing_zyx"));
+      nb::arg("sdf"), nb::arg("spacing_zyx"),
+      "Marker-controlled watershed segmentation of the SDF grid. Returns a flat int32 label per "
+      "voxel in the SDF's x-fastest order (reshape to sdf.shape): pore voxels (sdf > 0) carry the "
+      "id of the pore basin they belong to, 1, 2, ... in first-encounter (flat-index) order of the "
+      "basin peaks — the same peaks extract_pores finds — assigned by a gradient-ascent path to "
+      "the local SDF maximum; solid voxels (sdf <= 0) carry the NEGATIVE id -1, -2, ... of their "
+      "connected solid grain (26-connected components of the deep solid, sdf < -1.5 * min "
+      "spacing, flooded outwards by a Jacobi min-label sweep), and 0 marks solid debris no grain "
+      "reached. Periodic in all three directions. spacing_zyx only sets the deep-solid marker "
+      "threshold.");
 
   m.def(
-      "extract_topology_gpu",
+      "extract_topology",
       [](std::vector<int> segmentation, std::vector<int> shape_zyx) {
+        if (shape_zyx.size() != 3)
+          throw std::runtime_error("shape_zyx must be (Nz, Ny, Nx)");
         std::array<int, 3> res{shape_zyx[2], shape_zyx[1], shape_zyx[0]};
+        if (segmentation.size() != std::size_t(res[0]) * res[1] * res[2])
+          throw std::runtime_error("segmentation length does not match shape_zyx");
         return pnm::extract_topology_k(segmentation, res);
       },
-      nb::arg("segmentation"), nb::arg("shape"));
+      nb::arg("segmentation"), nb::arg("shape_zyx"),
+      "Label adjacency of a segment_volume result: the sorted, unique (a, b) pairs with a < b of "
+      "labels that share a voxel face (+x, +y, +z, periodic wrap). segmentation is the flat label "
+      "vector, shape_zyx = (Nz, Ny, Nx) of the grid it was made on (= sdf.shape). Pairs with a "
+      "label <= 0 are pore-solid (or grain-grain / debris) contacts; the pore-to-pore throats are "
+      "the pairs with both labels > 0. One entry per label pair (a per-PATCH throat list, which "
+      "can repeat a pair, is what extract_network_flow returns).");
 
   // Fused pipeline (F1): SDF uploaded once, segmentation device-resident across all three stages.
   m.def(

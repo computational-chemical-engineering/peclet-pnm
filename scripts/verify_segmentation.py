@@ -44,10 +44,9 @@ def verify_segmentation(input_file, output_file, edge_file):
              origin=origin)
     
     print("Extracting Topology...")
-    # Note: If extract_topology_gpu still needs the {nx, ny, nz} list for its 
-    # internal logic, we reverse our ZYX shape back to XYZ: shape[::-1]
-    connections = pnm.extract_topology_gpu(segmentation_flat, shape[::-1])
-    print(f"Found {len(connections)} connections.")
+    connections = pnm.extract_topology(segmentation_flat, shape_zyx=shape)
+    print(f"Found {len(connections)} connections "
+          f"({sum(1 for a, b in connections if a > 0 and b > 0)} pore-pore).")
     
     with open(edge_file, "w") as f:
         for u, v in connections:

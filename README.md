@@ -9,7 +9,7 @@ positive in the pore space), `peclet.pnm` extracts the pore network:
 - **`extract_pores`** — pore detection: local maxima of the SDF + weighted centroids and radii.
 - **`segment_volume`** — marker-controlled watershed segmentation of the pore space
   (marker init → union-find connected-component labelling → flood fill).
-- **`extract_topology_gpu`** — pore-to-pore connectivity (throats) from boundary pairs between basins.
+- **`extract_topology`** — label adjacency (pore-to-pore throats and pore-solid contacts) from boundary pairs between basins.
 - **`extract_pore_network`** — the fused pipeline (SDF uploaded once, segmentation device-resident
   across all three stages): returns `(pores, segmentation, connections)` in one call.
 
@@ -40,15 +40,21 @@ import peclet.pnm as pnm
 
 sdf_3d, origin_zyx, spacing_zyx = pnm.SDFReader.read_vti("packing.vti")  # (Nz,Ny,Nx) C-order
 pores = pnm.extract_pores(sdf_3d, origin_zyx, spacing_zyx)               # Pore(x,y,z,radius) list
-seg = pnm.segment_volume(sdf_3d, spacing_zyx)                            # flat per-voxel pore label
-conns = pnm.extract_topology_gpu(seg, list(sdf_3d.shape))                # [(label_a, label_b), ...]
+seg = pnm.segment_volume(sdf_3d, spacing_zyx)                            # flat per-voxel label
+conns = pnm.extract_topology(seg, shape_zyx=sdf_3d.shape)               # [(label_a, label_b), ...]
+throats = [(a, b) for a, b in conns if a > 0 and b > 0]                  # pore-pore pairs only
 
 # or fused (SDF uploaded once, segmentation stays device-resident across stages):
 pores, seg, conns = pnm.extract_pore_network(sdf_3d, origin_zyx, spacing_zyx)
 ```
 
-Conventions: the SDF array is `(Nz, Ny, Nx)` C-order (x fastest), `origin`/`spacing` are z-y-x;
-SDF sign is negative inside the solid — see the suite's `docs/CONVENTIONS.md`.
+Conventions: the SDF array is `(Nz, Ny, Nx)` C-order (x fastest) and every triple that describes
+it (`origin_zyx`, `spacing_zyx`, `shape_zyx`, `grad_p_zyx`) is z-y-x, marked by the suffix; SDF
+sign is negative inside the solid — see the suite's `docs/CONVENTIONS.md` and `docs/NAMING.md` §1.7.
+Labels from `segment_volume`: pores `1, 2, …`, solid grains `-1, -2, …`, `0` = unreached solid
+debris. Precision: the SDF is float32 and the geometry kernels compute in float32 (`origin_zyx` /
+`spacing_zyx` are narrowed to float32, so pore centres and radii are float32 in the input unit
+system); the network-flow MAC fields are float64.
 
 Smoke tests: `python scripts/test_extraction.py <sdf.vti>` and
 `python scripts/verify_segmentation.py <sdf.vti>` (writes a labelled `.vti` + a pore-pair edge list).

@@ -14,9 +14,15 @@ is pure C++. Part of the peclet suite (see `../CLAUDE.md` and `../docs/` for sui
   maxima + weighted centroid), marker-controlled watershed segmentation (marker init → union-find
   CCL → flood fill), gradient-path pore basins, boundary-pair throat topology. Device kernels live
   in the `.hpp` compiled as C++ (never `.cu`).
-- `pnm_bindings.cpp` — the nanobind module `peclet.pnm._pnm`: `SDFReader`, `extract_pores`,
-  `segment_volume`, `extract_topology_gpu`, and the fused `extract_pore_network` (SDF uploaded once,
-  segmentation device-resident across stages). Uses core's zero-copy View↔ndarray bridge.
+- `pnm_bindings.cpp` — the nanobind module `peclet.pnm._pnm`: `SDFReader`, `Pore`, `extract_pores`,
+  `segment_volume`, `extract_topology`, the fused `extract_pore_network` (SDF uploaded once,
+  segmentation device-resident across stages), `extract_network_flow`, and under `PECLET_PNM_MPI`
+  `mpi_rank`/`mpi_size`/`mpi_block` + `extract_pore_network_mpi`/`extract_network_flow_mpi`. Uses
+  core's zero-copy View↔ndarray bridge. Every z-y-x triple argument carries the `_zyx` suffix
+  (`origin_zyx`, `spacing_zyx`, `shape_zyx`, `global_shape_zyx`, `grad_p_zyx`; NAMING.md §1.7) —
+  `extract_topology_gpu(shape=)` was removed at 1.0.0 (the `_gpu` suffix was a CUDA-era leftover).
+  Precision: float32 SDF + geometry kernels, `origin_zyx`/`spacing_zyx` narrowed double→float32,
+  float64 MAC fields in the network-flow extraction.
 - `sdf_reader.{h,cpp}` — pure-C++ VTI (VTK ImageData) reader, backend-free.
 - `pore_extraction.hpp` also holds **`extract_network_flow_k`** (binding `extract_network_flow`):
   throat flow rates + pore-center pressures from a peclet.flow MAC field — the method from the
