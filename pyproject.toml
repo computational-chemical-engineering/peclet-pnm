@@ -52,7 +52,9 @@ build = "cp310-* cp311-* cp312-* cp313-*"
 skip = "*-musllinux* *_i686 pp*"
 build-frontend = "build"
 manylinux-x86_64-image = "manylinux_2_28"
-test-command = "python -c \"import numpy, peclet.pnm as p; sdf = -numpy.ones((8,8,8), dtype=numpy.float32); assert hasattr(p, 'extract_pores'); print('peclet.pnm', p.execution_space)\""
+# Real smoke: one spherical pore (SDF > 0 inside, peak at the integer center voxel) must extract as
+# exactly one pore of radius R with no throat, and the staged extract_pores must agree.
+test-command = "python -c \"import numpy as np, peclet.pnm as p; n, R = 16, 5.5; z, y, x = np.meshgrid(*(np.arange(n, dtype=np.float32),) * 3, indexing='ij'); sdf = (R - np.sqrt((x - 8) ** 2 + (y - 8) ** 2 + (z - 8) ** 2)).astype(np.float32); pores, seg, conns = p.extract_pore_network(sdf, [0.0] * 3, [1.0] * 3); assert len(pores) == 1 and abs(pores[0].radius - R) < 1e-6 and (pores[0].x, pores[0].y, pores[0].z) == (8.0, 8.0, 8.0), pores; assert not [c for c in conns if c[0] > 0 and c[1] > 0], conns; assert len(p.extract_pores(sdf, [0.0] * 3, [1.0] * 3)) == 1; print('peclet.pnm', p.execution_space, 'ok')\""
 
 [tool.cibuildwheel.environment]
 PECLET_VENDOR_DEPS = "ON"

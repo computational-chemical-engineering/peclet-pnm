@@ -41,10 +41,11 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdio>
 #include <Kokkos_Core.hpp>
 #include <Kokkos_UnorderedMap.hpp>
 #include <map>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -280,10 +281,18 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
   out.block_size = {geo.nx, geo.ny, geo.nz};
   const std::size_t nInner = std::size_t(geo.nx) * geo.ny * geo.nz;
   const std::size_t nExt = std::size_t(geo.ex) * geo.ey * geo.ez;
-  if (sdf_local.size() != nInner) {
-    std::fprintf(stderr, "[pnm::mpi] rank %d: sdf_local size %zu != block %dx%dx%d\n", rank,
-                 sdf_local.size(), geo.nx, geo.ny, geo.nz);
-    MPI_Abort(comm, 1);
+  // A caller-side size error is rank-local, but everything below is collective: agree on it
+  // first so every rank throws together instead of the good ranks hanging in the next exchange.
+  {
+    int bad = sdf_local.size() != nInner ? 1 : 0, anyBad = 0;
+    MPI_Allreduce(&bad, &anyBad, 1, MPI_INT, MPI_MAX, comm);
+    if (anyBad)
+      throw std::runtime_error(bad ? "[pnm::mpi] rank " + std::to_string(rank) +
+                                         ": sdf_local size " + std::to_string(sdf_local.size()) +
+                                         " != block " + std::to_string(geo.nx) + "x" +
+                                         std::to_string(geo.ny) + "x" + std::to_string(geo.nz)
+                                   : "[pnm::mpi] rank " + std::to_string(rank) +
+                                         ": sdf_local size mismatch on another rank");
   }
 
   Exec space;
@@ -675,8 +684,8 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
       if (!globalPending)
         break;
       if (++rounds > 100000) {
-        std::fprintf(stderr, "[pnm::mpi] gradient-root resolution did not converge\n");
-        MPI_Abort(comm, 2);
+        // collective: the round count and the Allreduce'd stop are identical on every rank
+        throw std::runtime_error("[pnm::mpi] gradient-root resolution did not converge");
       }
     }
   }
@@ -1014,8 +1023,8 @@ inline NetworkFlow extract_network_flow_mpi(
       if (!globalPending)
         break;
       if (++rounds > 100000) {
-        std::fprintf(stderr, "[pnm::mpi] flow-basin resolution did not converge\n");
-        MPI_Abort(comm, 3);
+        // collective: the round count and the Allreduce'd stop are identical on every rank
+        throw std::runtime_error("[pnm::mpi] flow-basin resolution did not converge");
       }
     }
   }
@@ -1483,8 +1492,8 @@ inline NetworkFlow extract_network_flow_mpi(
         if (!dm::allreduceMaxInt(hc2(), comm))
           break;
         if (++rounds2 > 100000) {
-          std::fprintf(stderr, "[pnm::mpi] film attachment did not converge\n");
-          MPI_Abort(comm, 4);
+          // collective: the round count and the Allreduce'd stop are identical on every rank
+          throw std::runtime_error("[pnm::mpi] film attachment did not converge");
         }
       }
     }

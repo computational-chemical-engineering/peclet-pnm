@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.24)
-project(peclet_pnm LANGUAGES CXX)
+
+# One version source: pyproject.toml (`version = "x.y.z"`). packaging/pyproject-cuda.toml,
+# CITATION.cff and docs/Doxyfile carry the same number and are checked against it by the suite's
+# release pre-flight (../tools/release/check_release_state.sh).
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/pyproject.toml" _peclet_pnm_version_line REGEX "^version")
+string(REGEX REPLACE "^version *= *\"([^\"]+)\".*$" "\\1" PECLET_PNM_VERSION "${_peclet_pnm_version_line}")
+if(NOT PECLET_PNM_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+")
+  message(FATAL_ERROR "could not read the version from pyproject.toml (got '${_peclet_pnm_version_line}')")
+endif()
+project(peclet_pnm VERSION ${PECLET_PNM_VERSION} LANGUAGES CXX)
 
 # peclet.pnm — pore-network extraction from SDF geometry (Kokkos GPU compute + the pure-C++ SDFReader
 # VTI reader), as an importable Python module. Split out of peclet-flow (2026-07): the CFD solve lives

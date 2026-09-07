@@ -1,9 +1,11 @@
-"""Smoke test for pore-network extraction from an SDF."""
-import sys
-import os
+"""Smoke test for pore-network extraction from an SDF.
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../build')))
-from peclet import pnm
+Run:  PYTHONPATH=<pnm/build> python scripts/test_extraction.py <sdf.vti>
+(e.g. ../flow/data/packing_ring.vti — 7199 pores). Writes the pores to pores.vtp.
+"""
+import sys
+
+import peclet.pnm as pnm
 
 def test_extraction(filename):
     print(f"Reading {filename}...")
@@ -57,13 +59,7 @@ def save_vtp(filename, pores):
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         pores = test_extraction(sys.argv[1])
-        outfile = "pores.vtp"
-        save_vtp(outfile, pores)
+        save_vtp("pores.vtp", pores)
     else:
-        # Default to a file in data/ if exists
-        default_file = "data/packing_ring.vti"
-        if os.path.exists(default_file):
-            pores = test_extraction(default_file)
-            save_vtp("pores.vtp", pores)
-        else:
-            print(f"Usage: {sys.argv[0]} <vti_file>")
+        print(f"Usage: {sys.argv[0]} <vti_file>")
+        sys.exit(2)

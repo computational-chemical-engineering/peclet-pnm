@@ -6,7 +6,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <sstream>
 #include <stdexcept>
 
@@ -31,7 +30,7 @@ SDFData SDFReader::read_vti(const std::string &filename) {
     throw std::runtime_error("Could not open file: " + filename);
   }
 
-  SDFData data;
+  SDFData data{};
 
   // Read file content line by line until we find AppendedData or similar
   // We assume the header is small enough to read comfortably
@@ -123,29 +122,23 @@ SDFData SDFReader::read_vti(const std::string &filename) {
     throw std::runtime_error("Failed to read data_bytes (UInt64) from file.");
   }
 
-  std::cout << "Read data length: " << data_bytes << std::endl;
-
-  size_t attempts = 0;
-  // Check if expected size matches our resolution
-  // Float32 = 4 bytes
-  size_t expected_bytes = data.size() * sizeof(float);
+  // The appended block must hold exactly one Float32 value per voxel of WholeExtent: anything
+  // else (a Float64/Int array, zlib-compressed appended data, a second array, a truncated file)
+  // would be read as garbage, so it is an error, not a warning.
+  const size_t expected_bytes = data.size() * sizeof(float);
   if (data_bytes != expected_bytes) {
-    std::cerr << "Warning: Data length in file (" << data_bytes
-              << ") does not match expected size from resolution (" << expected_bytes << ")."
-              << std::endl;
-    // Proceeding anyway but this is suspicious.
-    // It might be that the file size includes some padding or we misread
-    // resolution. Or maybe its compressed (zlib)? User said: "Appended Raw
-    // Binary". This implies uncompressed.
+    throw std::runtime_error("VTI appended data length (" + std::to_string(data_bytes) +
+                             " bytes) does not match WholeExtent x Float32 (" +
+                             std::to_string(expected_bytes) + " bytes) in " + filename +
+                             ": expected one uncompressed Float32 array (raw appended encoding)");
   }
 
-  // Read Data
   data.sdf_values.resize(data.size());
   file.read(reinterpret_cast<char *>(data.sdf_values.data()), data_bytes);
-
   if (file.gcount() != static_cast<std::streamsize>(data_bytes)) {
-    std::cerr << "Warning: Could not read all data. Read " << file.gcount() << " bytes."
-              << std::endl;
+    throw std::runtime_error("VTI file " + filename + " is truncated: read " +
+                             std::to_string(file.gcount()) + " of " + std::to_string(data_bytes) +
+                             " data bytes");
   }
 
   return data;

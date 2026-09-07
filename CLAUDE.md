@@ -63,7 +63,9 @@ PYTHONPATH=$PWD/build python scripts/verify_segmentation.py <sdf.vti>  # watersh
 # Canonical install: CMAKE_PREFIX_PATH=... pip install .   (-> peclet.pnm)
 ```
 
-Without a prefix, `cmake/PecletDeps.cmake` vendors Kokkos (OpenMP+Serial) + the peclet-core headers
+The CMake `project()` version is read from `pyproject.toml` (the one version source; the
+`packaging/pyproject-cuda.toml`, `CITATION.cff` and `docs/Doxyfile` copies are checked against it
+by the suite's release pre-flight). Without a prefix, `cmake/PecletDeps.cmake` vendors Kokkos (OpenMP+Serial) + the peclet-core headers
 via FetchContent (self-contained wheel path, `PECLET_VENDOR_DEPS=ON` in cibuildwheel). Keep the
 `PECLET_*_TAG` pins in lockstep with `../tools/bootstrap_deps.sh`.
 
@@ -75,6 +77,10 @@ cmake -S tests/kokkos_mpi -B build_kmpi -DCMAKE_PREFIX_PATH=$PWD/../extern/insta
   -DMPIEXEC_EXECUTABLE=/usr/bin/mpirun          # FORCE mpirun — ParaView's mpiexec runs singletons
 cmake --build build_kmpi -j && ctest --test-dir build_kmpi --output-on-failure
 ```
+`tests/kokkos_mpi/CMakeLists.txt` is a standalone project (like flow's / dem's) and hard-codes the
+core headers as `TPX_DIR=../../../core` (the suite sibling checkout, cache-overridable with
+`-DTPX_DIR=`); it does NOT go through `cmake/PecletDeps.cmake`, so it only builds inside the suite
+tree. Folding it into the root CMake under a `PECLET_PNM_BUILD_TESTS` option is QUALITY_PLAN §3.D.3.
 GPU pore-centroid caveat: nvcc FMA-contracts the centroid accumulation differently in the oracle
 vs distributed kernels, so pore POSITIONS are compared to 1e-5·spacing on CUDA (bitwise on
 OpenMP); seg ids, radii and connections are bitwise everywhere. The single-rank flood fill is

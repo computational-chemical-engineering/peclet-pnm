@@ -1,15 +1,15 @@
 /// @file
-/// @brief flow — portable (Kokkos) pore-network extraction from an SDF.
+/// @brief peclet.pnm — portable (Kokkos) single-rank pore-network extraction from an SDF.
 ///
-/// Kokkos port of pore_extraction.cu (the pnm_backend module): pore detection (local maxima +
-/// weighted centroid), marker-controlled watershed segmentation of the solid (init markers ->
-/// union-find CCL -> flood fill), gradient-path pore basins, and boundary-pair topology.
-/// Grid-stride __global__ kernels -> Kokkos::parallel_for, atomicAdd/atomicMin -> Kokkos::atomic_*,
-/// cudaMalloc/Memcpy -> Kokkos::View + deep_copy. The thrust includes in the .cu were dead
-/// (sort/unique is host std::sort). Host orchestration (label renumber via std::map, topology
-/// sort/unique) stays on the host. Runs on any Kokkos backend.
-#ifndef PECLET_FLOW_PORE_EXTRACTION_HPP
-#define PECLET_FLOW_PORE_EXTRACTION_HPP
+/// Pore detection (local maxima of the SDF + weighted centroid), marker-controlled watershed
+/// segmentation of the solid (init markers -> union-find CCL -> flood fill), gradient-path pore
+/// basins, boundary-pair throat topology, and the network-flow extraction from a peclet.flow MAC
+/// field. Device kernels are Kokkos::parallel_for over Kokkos::Views (any backend: CUDA / HIP /
+/// OpenMP / Serial); host orchestration (label renumber, topology sort/unique) stays on the host.
+/// The distributed pipeline (pore_extraction_mpi.hpp) reproduces these stages on the core block
+/// decomposition, bit-exact.
+#ifndef PECLET_PNM_PORE_EXTRACTION_HPP
+#define PECLET_PNM_PORE_EXTRACTION_HPP
 
 #include <algorithm>
 #include <array>
@@ -1026,4 +1026,4 @@ inline PoreNetwork extract_pore_network_k(const std::vector<float>& sdf_h,
 
 }  // namespace pnm
 
-#endif  // PECLET_FLOW_PORE_EXTRACTION_HPP
+#endif  // PECLET_PNM_PORE_EXTRACTION_HPP

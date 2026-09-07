@@ -5,7 +5,6 @@
 #include <vector>
 #include <string>
 #include <array>
-#include <iostream>
 
 struct SDFData {
     std::vector<float> sdf_values; // Flattened SDF grid

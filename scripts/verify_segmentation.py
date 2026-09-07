@@ -1,13 +1,15 @@
-"""Verify the SDF segmentation / geometry import."""
-import sys
-import os
-import struct
-import numpy as np
-import argparse
+"""Verify the SDF segmentation / geometry import.
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../build')))
-from peclet import pnm
-from vti import save_vti
+Run:  PYTHONPATH=<pnm/build> python scripts/verify_segmentation.py <sdf.vti>
+Writes the labelled volume (segmentation.vti) and the pore-pair edge list (network.edges).
+"""
+import argparse
+import os
+
+import numpy as np
+
+import peclet.pnm as pnm
+from vti import save_vti  # scripts/vti.py — the (Nz,Ny,Nx) VTI writer beside this script
 
 def verify_segmentation(input_file, output_file, edge_file):
     print(f"Reading {input_file}...")
