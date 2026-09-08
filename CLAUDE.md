@@ -10,10 +10,21 @@ compute is **Kokkos** (CUDA / HIP / OpenMP — backend selected by the install p
 is pure C++. Part of the peclet suite (see `../CLAUDE.md` and `../docs/` for suite-wide conventions).
 
 **Sources** (all under `src/`):
-- `pore_extraction.hpp` — `namespace pnm`, header-only Kokkos compute: pore detection (local SDF
-  maxima + weighted centroid), marker-controlled watershed segmentation (marker init → union-find
-  CCL → flood fill), gradient-path pore basins, boundary-pair throat topology. Device kernels live
-  in the `.hpp` compiled as C++ (never `.cu`).
+- `pore_kernels.hpp` — `namespace pnm::kernels`, the ONE set of stage kernels both pipelines run
+  (QUALITY_PLAN G.3): pore detection, marker init, union-find CCL merge/flatten/fixpoint, Jacobi
+  flood sweep/fixpoint, the steepest-neighbour stencil (+ the single-rank gradient walk, the
+  forest init and the hold-at-ghost resolve round), boundary pairs, and the network-flow face
+  stages (face init, face CCL merge, min-fid, core/leftover labelling, film attachment, throat
+  flux, the throat-slot and pressure-drop host helpers). Every kernel is templated on a GEOMETRY
+  POLICY (`GridGeo` = the whole periodic grid, single-rank; `BlockGeo` = a ghost-extended block,
+  MPI) that supplies `cell()/gid()/owned()/inOwned()/localOf()/...` — same expressions, same
+  evaluation order in both instantiations, which is what keeps the multi-rank result bit-exact.
+  A stage-kernel fix is made HERE, once; neither pipeline file may re-inline a stage body.
+  Also holds the shared types (`Pore`, `I3`, `Index`, `Exec/Mem`) and `uploadVec/downloadN`.
+- `pore_extraction.hpp` — `namespace pnm`, the single-rank orchestration over those kernels:
+  device-resident buffers, the fixpoint loops (trivial sync), the device scan renumbering, the
+  per-pore network-flow kernels (peak/centre/pressure) and the host topology sort/unique. Device
+  kernels live in `.hpp` compiled as C++ (never `.cu`).
 - `pnm_bindings.cpp` — the nanobind module `peclet.pnm._pnm`: `SDFReader`, `Pore`, `extract_pores`,
   `segment_volume`, `extract_topology`, the fused `extract_pore_network` (SDF uploaded once,
   segmentation device-resident across stages), `extract_network_flow`, and under `PECLET_PNM_MPI`
@@ -49,8 +60,12 @@ is pure C++. Part of the peclet suite (see `../CLAUDE.md` and `../docs/` for sui
   criterion is geometric and parameter-free); films attach to the min reachable core patch by
   Jacobi min-propagation (cannot bridge two cores), unreachable films form their own patches.
 - `pore_extraction_mpi.hpp` — the **distributed** pipeline (gated `PECLET_PNM_MPI`): core ORB
-  decomposition + g=1 `GridHalo` exchange; labels are GLOBAL voxel ids so every fixpoint is
-  decomposition-independent → **bit-exact to single-rank**. Stage design: local union-find CCL +
+  decomposition + g=1 `GridHalo` exchange around the SAME `pore_kernels.hpp` kernels on
+  `BlockGeo`; this file holds only the halo exchanges, the ownership/merge orchestration
+  (`detail_mpi::globalMerge/applyRemap`, `resolveToFixpoint`, the extended-field staging and
+  scatters) and the distributed reductions (`minByKey`, allgathers, Allreduces). Labels are
+  GLOBAL voxel ids so every fixpoint is decomposition-independent → **bit-exact to
+  single-rank**. Stage design: local union-find CCL +
   one-shot boundary-graph merge (allgathered surface pairs, host union-find); Jacobi flood
   (sweep-for-sweep = the single-rank Jacobi flood); gradient roots via hold-at-ghost pointer
   jumping with a `~root` finalization marker (NEVER store a remote mid-chain gid — that strands
