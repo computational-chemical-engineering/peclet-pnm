@@ -133,4 +133,11 @@ sweep-for-sweep; don't "optimize" it back to in-place.
   `origin`/`spacing` tuples are **z-y-x**. `segment_volume` returns a flat label vector.
 - `Kokkos::initialize` happens at import; `Kokkos::finalize` is registered via `atexit`
   (REQUIRED on CUDA — see the comment in `pnm_bindings.cpp`).
+- **The library never prints** (QUALITY_PLAN §3.H.6): there is no `cout`/`cerr`/`fprintf` in
+  `src/` and no verbosity flag to forget. Every failure path — a malformed/truncated VTI, a
+  shape mismatch, a stage that does not reach its fixpoint — `throw`s `std::runtime_error`
+  (a Python `RuntimeError`) with the offending sizes in the message. In the MPI pipeline the
+  throw is COLLECTIVE: the condition is `MPI_Allreduce`d first so every rank raises together
+  instead of the good ranks hanging in the next exchange — keep that pattern when adding a
+  guard to `pore_extraction_mpi.hpp`.
 - Test VTI inputs live in the suite (e.g. `../flow/data/packing_ring.vti`), not in this repo.

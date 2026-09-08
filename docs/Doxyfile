@@ -1,4 +1,4 @@
-# Doxygen configuration for peclet.flow. Generates HTML API docs for the Kokkos C++ sources (src/) and the
+# Doxygen configuration for peclet.pnm. Generates HTML API docs for the Kokkos C++ sources (src/) and the
 # Python driver/verification scripts (scripts/, tests/). Build with:  doxygen docs/Doxyfile
 # Output lands in docs/html/ ; the Documentation CI workflow publishes it to GitHub Pages.
 
