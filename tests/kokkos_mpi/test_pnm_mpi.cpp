@@ -17,9 +17,9 @@
 #include <tuple>
 #include <vector>
 
+#include "../synthetic_sdf.hpp"
 #include "pore_extraction.hpp"
 #include "pore_extraction_mpi.hpp"
-#include "../synthetic_sdf.hpp"
 
 using pnm::Index;
 using pnm::Pore;
@@ -143,8 +143,7 @@ int main(int argc, char** argv) {
     fail += runCase("sphere_lattice", {36, 30, 24}, {0.f, 0.f, 0.f}, {1.f, 1.f, 1.f},
                     pnm::test::sphereLatticeSdf, MPI_COMM_WORLD);
     fail += runCase("trig_field", {32, 32, 32}, {-1.f, 2.f, 0.5f}, {0.5f, 1.f, 2.f},
-                    pnm::test::trigSdf,
-                    MPI_COMM_WORLD);
+                    pnm::test::trigSdf, MPI_COMM_WORLD);
   }
   MPI_Finalize();
   return fail ? 1 : 0;

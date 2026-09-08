@@ -649,8 +649,7 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
       haloI.exchange(targetE);
       int pending = 0;
       Kokkos::parallel_reduce(
-          "pnm::mpi::resolve_roots",
-          Kokkos::RangePolicy<Exec>(space, 0, nInner),
+          "pnm::mpi::resolve_roots", Kokkos::RangePolicy<Exec>(space, 0, nInner),
           KOKKOS_LAMBDA(std::size_t o, int& pend) {
             const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
                       iz = int(o / (Index(g.nx) * g.ny));
@@ -670,7 +669,7 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
               const Index nl = g.localOf(tv);
               if (nl < 0)
                 break;  // next hop leaves the block: hold at tl, wait for its owner
-              t = tv;    // advance within the block
+              t = tv;   // advance within the block
             }
             if (t != targetE(ci))
               targetE(ci) = t;
@@ -695,27 +694,31 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
   {
     const BlockGeo g = geo;
     // Pore roots: per-rank (root -> min appearance gid), then a global min-reduce.
-    auto locPores = dm::minByKey(nInner, KOKKOS_LAMBDA(std::size_t o, Index& k, Index& v) {
-      const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny), iz = int(o / (Index(g.nx) * g.ny));
-      const Index e = g.lidx(ix + 1, iy + 1, iz + 1);
-      if (sdfE(e) <= 0.0f)
-        return false;
-      k = ~targetE(e);  // finalized state stores ~root
-      v = g.gidAt(ix + 1, iy + 1, iz + 1);
-      return true;
-    });
+    auto locPores = dm::minByKey(
+        nInner, KOKKOS_LAMBDA(std::size_t o, Index & k, Index & v) {
+          const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
+                    iz = int(o / (Index(g.nx) * g.ny));
+          const Index e = g.lidx(ix + 1, iy + 1, iz + 1);
+          if (sdfE(e) <= 0.0f)
+            return false;
+          k = ~targetE(e);  // finalized state stores ~root
+          v = g.gidAt(ix + 1, iy + 1, iz + 1);
+          return true;
+        });
     // Solid labels: min appearance gid over ALL labelled voxels (a flood-filled shallow voxel can
     // precede the component's min marker in gid order, so the label value alone is NOT the first
     // appearance).
-    auto locSolids = dm::minByKey(nInner, KOKKOS_LAMBDA(std::size_t o, Index& k, Index& v) {
-      const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny), iz = int(o / (Index(g.nx) * g.ny));
-      const Index e = g.lidx(ix + 1, iy + 1, iz + 1);
-      if (sdfE(e) > 0.0f || labelE(e) == -1)
-        return false;
-      k = labelE(e);
-      v = g.gidAt(ix + 1, iy + 1, iz + 1);
-      return true;
-    });
+    auto locSolids = dm::minByKey(
+        nInner, KOKKOS_LAMBDA(std::size_t o, Index & k, Index & v) {
+          const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
+                    iz = int(o / (Index(g.nx) * g.ny));
+          const Index e = g.lidx(ix + 1, iy + 1, iz + 1);
+          if (sdfE(e) > 0.0f || labelE(e) == -1)
+            return false;
+          k = labelE(e);
+          v = g.gidAt(ix + 1, iy + 1, iz + 1);
+          return true;
+        });
     auto allPores = dm::allgatherv(locPores, comm);
     auto allSolids = dm::allgatherv(locSolids, comm);
     // min-reduce per key, then order by min appearance (== single-rank first-encounter order).
@@ -846,9 +849,9 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
 inline NetworkFlow extract_network_flow_mpi(
     const std::vector<float>& sdf_local, std::array<int, 3> gdims, std::array<float, 3> origin,
     std::array<float, 3> spacing, const std::vector<double>& u_h, const std::vector<double>& v_h,
-    const std::vector<double>& w_h, const std::vector<double>& p_h,
-    const std::vector<double>& ox_h, const std::vector<double>& oy_h,
-    const std::vector<double>& oz_h, std::array<double, 3> grad_p, MPI_Comm comm) {
+    const std::vector<double>& w_h, const std::vector<double>& p_h, const std::vector<double>& ox_h,
+    const std::vector<double>& oy_h, const std::vector<double>& oz_h, std::array<double, 3> grad_p,
+    MPI_Comm comm) {
   namespace dm = detail_mpi;
   using peclet::core::View;
   using peclet::core::halo::GridHalo;
@@ -1159,13 +1162,12 @@ inline NetworkFlow extract_network_flow_mpi(
           for (int dz = 0; dz < 2; ++dz)
             for (int dy = 0; dy < 2; ++dy)
               for (int dx = 0; dx < 2; ++dx) {
-                const double wt = (dx ? f[0] : 1.0 - f[0]) * (dy ? f[1] : 1.0 - f[1]) *
-                                  (dz ? f[2] : 1.0 - f[2]);
-                const Index e2 = gg.localOf(
-                    (Index(BlockGeo::wrapc(b[2] + dz, gg.gnz)) * gg.gny +
-                     BlockGeo::wrapc(b[1] + dy, gg.gny)) *
-                        gg.gnx +
-                    BlockGeo::wrapc(b[0] + dx, gg.gnx));
+                const double wt =
+                    (dx ? f[0] : 1.0 - f[0]) * (dy ? f[1] : 1.0 - f[1]) * (dz ? f[2] : 1.0 - f[2]);
+                const Index e2 = gg.localOf((Index(BlockGeo::wrapc(b[2] + dz, gg.gnz)) * gg.gny +
+                                             BlockGeo::wrapc(b[1] + dy, gg.gny)) *
+                                                gg.gnx +
+                                            BlockGeo::wrapc(b[0] + dx, gg.gnx));
                 acc += wt * pE2(e2);
               }
           rec.press = acc;
@@ -1224,8 +1226,7 @@ inline NetworkFlow extract_network_flow_mpi(
             const bool itf = (a != b && a > 0 && b > 0 && opn > 0.0);
             fcoreL(3 * o + d) = (itf && sdfE(ce) > 0.0f && sdfE(nb) > 0.0f) ? 1 : 0;
             parent(3 * o + d) = fcoreL(3 * o + d) ? int(3 * o + d) : -1;
-            fpairL(3 * o + d) =
-                itf ? ((Index(a < b ? a : b) << 32) | (a < b ? b : a)) : Index(-1);
+            fpairL(3 * o + d) = itf ? ((Index(a < b ? a : b) << 32) | (a < b ? b : a)) : Index(-1);
           }
         });
     space.fence();
@@ -1302,8 +1303,7 @@ inline NetworkFlow extract_network_flow_mpi(
     space.fence();
     Kokkos::parallel_for(
         "pnm::nfmpi::face_label", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
-          faceLab(f) =
-              parent(f) >= 0 ? mg(parent(f)) : (fpairL(f) >= 0 ? kSent : Index(-1));
+          faceLab(f) = parent(f) >= 0 ? mg(parent(f)) : (fpairL(f) >= 0 ? kSent : Index(-1));
         });
     space.fence();
     // scatter CORE labels (+ pair keys, once) into per-direction extended fields and exchange
@@ -1501,9 +1501,8 @@ inline NetworkFlow extract_network_flow_mpi(
     // merge, exactly like the core tier but restricted to still-kSent faces
     {
       Kokkos::parallel_for(
-          "pnm::nfmpi::leftover_init", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
-            parent(f) = (faceLab(f) == kSent) ? int(f) : -1;
-          });
+          "pnm::nfmpi::leftover_init", R1(space, 0, nfL),
+          KOKKOS_LAMBDA(std::size_t f) { parent(f) = (faceLab(f) == kSent) ? int(f) : -1; });
       space.fence();
       int h_changed2 = 1;
       while (h_changed2) {

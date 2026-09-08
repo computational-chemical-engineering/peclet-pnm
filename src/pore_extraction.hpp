@@ -493,8 +493,8 @@ struct NetworkFlow {
 inline NetworkFlow extract_network_flow_k(
     const std::vector<float>& sdf_h, std::array<int, 3> resolution, std::array<float, 3> origin,
     std::array<float, 3> spacing, const std::vector<double>& u_h, const std::vector<double>& v_h,
-    const std::vector<double>& w_h, const std::vector<double>& p_h,
-    const std::vector<double>& ox_h, const std::vector<double>& oy_h,
+    const std::vector<double>& w_h, const std::vector<double>& p_h, const std::vector<double>& ox_h,
+    const std::vector<double>& oy_h,
     const std::vector<double>& oz_h,  // pass empty vectors for a fully-open (non-cut-cell) grid
     std::array<double, 3> grad_p) {
   NetworkFlow out;
@@ -558,8 +558,8 @@ inline NetworkFlow extract_network_flow_k(
             fy = py / sw;
             fz = pz / sw;
           }
-          poresD(k) = Pore{oxo + (ix + fx) * sx, oyo + (iy + fy) * sy, ozo + (iz + fz) * sz,
-                           sdf(ci)};
+          poresD(k) =
+              Pore{oxo + (ix + fx) * sx, oyo + (iy + fy) * sy, ozo + (iz + fz) * sz, sdf(ci)};
         });
     space.fence();
   }
@@ -599,8 +599,8 @@ inline NetworkFlow extract_network_flow_k(
           for (int dz = 0; dz < 2; ++dz)
             for (int dy = 0; dy < 2; ++dy)
               for (int dx = 0; dx < 2; ++dx) {
-                const double wt = (dx ? f[0] : 1.0 - f[0]) * (dy ? f[1] : 1.0 - f[1]) *
-                                  (dz ? f[2] : 1.0 - f[2]);
+                const double wt =
+                    (dx ? f[0] : 1.0 - f[0]) * (dy ? f[1] : 1.0 - f[1]) * (dz ? f[2] : 1.0 - f[2]);
                 acc += wt * p(get_idx(b[0] + dx, b[1] + dy, b[2] + dz, r));
               }
           ppres(k) = acc;
@@ -669,8 +669,8 @@ inline NetworkFlow extract_network_flow_k(
   // become their own patches. Every interface face lands in exactly one patch — exact bookkeeping.
   const std::size_t nf = 3 * n;
   constexpr std::int64_t kSent = 0x7ffffffffffffffeLL;
-  Kokkos::View<std::int64_t*, Mem> fpar("nf::fpar", nf);   // final patch label per face, -1 = none
-  Kokkos::View<std::int64_t*, Mem> fpair("nf::fpair", nf); // (lo<<32|hi) pair key per face
+  Kokkos::View<std::int64_t*, Mem> fpar("nf::fpar", nf);    // final patch label per face, -1 = none
+  Kokkos::View<std::int64_t*, Mem> fpair("nf::fpair", nf);  // (lo<<32|hi) pair key per face
   {
     const I3 r = res;
     const bool ho = hasOpen;

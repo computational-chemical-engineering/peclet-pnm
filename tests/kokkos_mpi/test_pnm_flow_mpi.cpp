@@ -16,9 +16,9 @@
 #include <Kokkos_Core.hpp>
 #include <vector>
 
+#include "../synthetic_sdf.hpp"
 #include "pore_extraction.hpp"
 #include "pore_extraction_mpi.hpp"
-#include "../synthetic_sdf.hpp"
 
 using pnm::Pore;
 
@@ -28,18 +28,24 @@ double fld(int c, int gx, int gy, int gz, std::array<int, 3> gd) {
   const double x = 2.0 * M_PI * gx / gd[0], y = 2.0 * M_PI * gy / gd[1],
                z = 2.0 * M_PI * gz / gd[2];
   switch (c) {
-    case 0: return std::sin(x) * std::cos(y) + 0.3 * std::cos(2 * z);
-    case 1: return std::cos(x) * std::sin(z) - 0.2 * std::sin(y);
-    case 2: return std::sin(y) * std::sin(z) + 0.1 * std::cos(x);
-    case 3: return std::cos(x + y) + 0.5 * std::sin(z - x);          // p
+    case 0:
+      return std::sin(x) * std::cos(y) + 0.3 * std::cos(2 * z);
+    case 1:
+      return std::cos(x) * std::sin(z) - 0.2 * std::sin(y);
+    case 2:
+      return std::sin(y) * std::sin(z) + 0.1 * std::cos(x);
+    case 3:
+      return std::cos(x + y) + 0.5 * std::sin(z - x);  // p
     default: {
-      const double s = 0.5 + 0.5 * std::sin(x + 2 * y - z);          // openness in [0,1]
+      const double s = 0.5 + 0.5 * std::sin(x + 2 * y - z);  // openness in [0,1]
       return s < 0.02 ? 0.0 : s;
     }
   }
 }
 
-bool close(double a, double b, double tol) { return std::fabs(a - b) <= tol; }
+bool close(double a, double b, double tol) {
+  return std::fabs(a - b) <= tol;
+}
 
 int runConfig(const char* name, bool withOpen, MPI_Comm comm) {
   const std::array<int, 3> gd{36, 30, 24};
@@ -68,9 +74,9 @@ int runConfig(const char* name, bool withOpen, MPI_Comm comm) {
           fldL[c][i] = fld(4, gx + c, gy, gz, gd);  // three distinct openness fields
       }
   std::vector<double> none;
-  auto dist = pnm::extract_network_flow_mpi(
-      sdfL, gd, org, spc, fldL[0], fldL[1], fldL[2], fldL[3], withOpen ? fldL[4] : none,
-      withOpen ? fldL[5] : none, withOpen ? fldL[6] : none, gp, comm);
+  auto dist = pnm::extract_network_flow_mpi(sdfL, gd, org, spc, fldL[0], fldL[1], fldL[2], fldL[3],
+                                            withOpen ? fldL[4] : none, withOpen ? fldL[5] : none,
+                                            withOpen ? fldL[6] : none, gp, comm);
 
   int fail = 0;
   if (rank == 0) {
@@ -121,8 +127,8 @@ int runConfig(const char* name, bool withOpen, MPI_Comm comm) {
             !close(a.y, b.y, 1e-5 * spc[1]) || !close(a.z, b.z, 1e-5 * spc[2]) ||
             !close(dist.pore_pressure[k], orc.pore_pressure[k], 1e-9) ||
             !close(dist.pore_residual[k], orc.pore_residual[k], 1e-10 * qs)) {
-          std::printf("[%s] FAIL pore %zu (r %.9g vs %.9g, p %.15e vs %.15e)\n", name, k,
-                      a.radius, b.radius, dist.pore_pressure[k], orc.pore_pressure[k]);
+          std::printf("[%s] FAIL pore %zu (r %.9g vs %.9g, p %.15e vs %.15e)\n", name, k, a.radius,
+                      b.radius, dist.pore_pressure[k], orc.pore_pressure[k]);
           fail = 1;
         }
       }

@@ -234,8 +234,7 @@ NB_MODULE(_pnm, m) {
       [](nb::ndarray<float, nb::c_contig> sdf, std::vector<double> origin_zyx,
          std::vector<double> spacing_zyx, nb::ndarray<double, nb::c_contig> u,
          nb::ndarray<double, nb::c_contig> v, nb::ndarray<double, nb::c_contig> w,
-         nb::ndarray<double, nb::c_contig> p,
-         std::optional<nb::ndarray<double, nb::c_contig>> ox,
+         nb::ndarray<double, nb::c_contig> p, std::optional<nb::ndarray<double, nb::c_contig>> ox,
          std::optional<nb::ndarray<double, nb::c_contig>> oy,
          std::optional<nb::ndarray<double, nb::c_contig>> oz, std::vector<double> grad_p_zyx) {
         std::array<int, 3> res;
@@ -247,9 +246,8 @@ NB_MODULE(_pnm, m) {
                                  (float)spacing_zyx[0]};
         std::array<double, 3> gp{grad_p_zyx[2], grad_p_zyx[1], grad_p_zyx[0]};
         auto net = pnm::extract_network_flow_k(
-            sv, res, org, spc, to_field(u, res, "u"), to_field(v, res, "v"),
-            to_field(w, res, "w"), to_field(p, res, "p"),
-            ox ? to_field(*ox, res, "ox") : std::vector<double>{},
+            sv, res, org, spc, to_field(u, res, "u"), to_field(v, res, "v"), to_field(w, res, "w"),
+            to_field(p, res, "p"), ox ? to_field(*ox, res, "ox") : std::vector<double>{},
             oy ? to_field(*oy, res, "oy") : std::vector<double>{},
             oz ? to_field(*oz, res, "oz") : std::vector<double>{}, gp);
         nb::dict d;
@@ -361,9 +359,8 @@ NB_MODULE(_pnm, m) {
                                  (float)spacing_zyx[0]};
         std::array<double, 3> gp{grad_p_zyx[2], grad_p_zyx[1], grad_p_zyx[0]};
         auto net = pnm::extract_network_flow_mpi(
-            sv, gd, org, spc, to_field(u, res, "u"), to_field(v, res, "v"),
-            to_field(w, res, "w"), to_field(p, res, "p"),
-            ox ? to_field(*ox, res, "ox") : std::vector<double>{},
+            sv, gd, org, spc, to_field(u, res, "u"), to_field(v, res, "v"), to_field(w, res, "w"),
+            to_field(p, res, "p"), ox ? to_field(*ox, res, "ox") : std::vector<double>{},
             oy ? to_field(*oy, res, "oy") : std::vector<double>{},
             oz ? to_field(*oz, res, "oz") : std::vector<double>{}, gp, MPI_COMM_WORLD);
         nb::dict d;
