@@ -42,6 +42,6 @@ foreach(t pnm_mpi pnm_flow_mpi)
     add_test(NAME ${t}_np${np}
              COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${np} ${_pnm_mpiexec_preflags}
                      $<TARGET_FILE:test_${t}>)
-    set_tests_properties(${t}_np${np} PROPERTIES PROCESSORS ${np})
+    set_tests_properties(${t}_np${np} PROPERTIES PROCESSORS ${np} LABELS mpi)
   endforeach()
 endforeach()
