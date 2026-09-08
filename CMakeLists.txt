@@ -36,6 +36,12 @@ option(PECLET_CUDA_RUNTIME_WHEEL "RPATH the module to the nvidia-cuda-runtime wh
 # single-rank). OFF (default) leaves the single-rank module byte-identical. Mirrors PECLET_FLOW_MPI.
 option(PECLET_PNM_MPI "Build the pnm module with the distributed (MPI) extraction exposed" OFF)
 
+# Tests: -DPECLET_PNM_BUILD_TESTS=ON registers the single-rank C++ contract (tests/kokkos), the
+# Python binding smoke + the 7199-pore packing_ring gate (tests/python; the gate SKIPS when the
+# suite data file is absent) and, with PECLET_PNM_MPI, the distributed np=1,2,4 suite
+# (tests/kokkos_mpi). OFF by default so wheel builds are unaffected; ON in CI and the dev recipe.
+option(PECLET_PNM_BUILD_TESTS "Build and register the pnm test suites (ctest)" OFF)
+
 # Dependencies via the vendored PecletDeps helper: an installed Kokkos prefix + sibling checkout for
 # the dev/suite build, or FetchContent-built Kokkos + fetched core headers for a self-contained
 # sdist/wheel (cibuildwheel). See cmake/PecletDeps.cmake.
@@ -83,6 +89,29 @@ endif()
 if(PECLET_CUDA_RUNTIME_WHEEL)
   set_target_properties(pnm PROPERTIES
     INSTALL_RPATH "$ORIGIN/../../nvidia/cu13/lib" INSTALL_RPATH_USE_LINK_PATH OFF)
+endif()
+
+# --- tests (one tree per backend: the same Kokkos/MPI targets + core headers as the module) -----
+if(PECLET_PNM_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests/kokkos)
+  if(PECLET_PNM_MPI)
+    add_subdirectory(tests/kokkos_mpi)
+  endif()
+  # Python binding tests run against the module staged in this build tree (PYTHONPATH=<build>).
+  add_test(NAME pnm_python_smoke
+           COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_smoke.py")
+  # The 7199-pore gate needs the suite's ring packing (../flow/data, not shipped with this repo):
+  # the script exits 77 when the file is absent and ctest reports the test as SKIPPED, not passed.
+  set(PECLET_PNM_PACKING_RING_VTI "${CMAKE_CURRENT_SOURCE_DIR}/../flow/data/packing_ring.vti"
+      CACHE FILEPATH "The 256^3 ring-packing SDF the packing_ring gate extracts (7199 pores)")
+  add_test(NAME pnm_python_packing_ring
+           COMMAND "${Python_EXECUTABLE}"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_packing_ring.py"
+                   "${PECLET_PNM_PACKING_RING_VTI}")
+  set_tests_properties(pnm_python_smoke pnm_python_packing_ring PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
+  set_tests_properties(pnm_python_packing_ring PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # --- pip / scikit-build-core install rule -------------------------------------------------------

@@ -18,27 +18,11 @@
 
 #include "pore_extraction.hpp"
 #include "pore_extraction_mpi.hpp"
+#include "../synthetic_sdf.hpp"
 
 using pnm::Pore;
 
 namespace {
-
-float sphereLatticeSdf(int gx, int gy, int gz, std::array<int, 3> gd) {
-  const float R = 0.22f * std::min(gd[0], std::min(gd[1], gd[2]));
-  float best = 1e30f;
-  for (int cz = 0; cz < 2; ++cz)
-    for (int cy = 0; cy < 2; ++cy)
-      for (int cx = 0; cx < 2; ++cx) {
-        const float ccx = gd[0] * (2 * cx + 1) / 4.0f, ccy = gd[1] * (2 * cy + 1) / 4.0f,
-                    ccz = gd[2] * (2 * cz + 1) / 4.0f;
-        float dx = std::fabs(gx - ccx), dy = std::fabs(gy - ccy), dz = std::fabs(gz - ccz);
-        dx = std::min(dx, gd[0] - dx);
-        dy = std::min(dy, gd[1] - dy);
-        dz = std::min(dz, gd[2] - dz);
-        best = std::min(best, std::sqrt(dx * dx + dy * dy + dz * dz) - R);
-      }
-  return best;
-}
 
 double fld(int c, int gx, int gy, int gz, std::array<int, 3> gd) {
   const double x = 2.0 * M_PI * gx / gd[0], y = 2.0 * M_PI * gy / gd[1],
@@ -77,7 +61,7 @@ int runConfig(const char* name, bool withOpen, MPI_Comm comm) {
       for (int x = 0; x < bs[0]; ++x) {
         const std::size_t i = (std::size_t(z) * bs[1] + y) * bs[0] + x;
         const int gx = bo[0] + x, gy = bo[1] + y, gz = bo[2] + z;
-        sdfL[i] = sphereLatticeSdf(gx, gy, gz, gd);
+        sdfL[i] = pnm::test::sphereLatticeSdf(gx, gy, gz, gd);
         for (int c = 0; c < 4; ++c)
           fldL[c][i] = fld(c, gx, gy, gz, gd);
         for (int c = 4; c < 7; ++c)
@@ -99,7 +83,7 @@ int runConfig(const char* name, bool withOpen, MPI_Comm comm) {
       for (int y = 0; y < gd[1]; ++y)
         for (int x = 0; x < gd[0]; ++x) {
           const std::size_t i = (std::size_t(z) * gd[1] + y) * gd[0] + x;
-          sdfG[i] = sphereLatticeSdf(x, y, z, gd);
+          sdfG[i] = pnm::test::sphereLatticeSdf(x, y, z, gd);
           for (int c = 0; c < 4; ++c)
             fldG[c][i] = fld(c, x, y, z, gd);
           for (int c = 4; c < 7; ++c)

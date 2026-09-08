@@ -76,17 +76,35 @@ via FetchContent (self-contained wheel path, `PECLET_VENDOR_DEPS=ON` in cibuildw
 `PECLET_*_TAG` pins in lockstep with `../tools/bootstrap_deps.sh`.
 
 Multi-rank (MPI): add `-DPECLET_PNM_MPI=ON` to expose `mpi_rank`/`mpi_size`/`mpi_block` +
-`extract_pore_network_mpi` (collective; see README). The C++ MPI ctests (np=1,2,4, distributed vs
-single-rank oracle, bit-exact):
+`extract_pore_network_mpi` (collective; see README).
+
+**Tests** (`-DPECLET_PNM_BUILD_TESTS=ON`, OFF by default so wheel builds are unaffected; ON in CI).
+One tree per backend — the test targets reuse the module's resolved Kokkos/MPI targets and core
+include path (QUALITY_PLAN §3.D.3 done):
 ```bash
-cmake -S tests/kokkos_mpi -B build_kmpi -DCMAKE_PREFIX_PATH=$PWD/../extern/install/nvidia-cuda \
+cmake -S . -B build_dev -DCMAKE_PREFIX_PATH=$PWD/../extern/install/nvidia-cuda \
+  -DPECLET_PNM_MPI=ON -DPECLET_PNM_BUILD_TESTS=ON \
   -DMPIEXEC_EXECUTABLE=/usr/bin/mpirun          # FORCE mpirun — ParaView's mpiexec runs singletons
-cmake --build build_kmpi -j && ctest --test-dir build_kmpi --output-on-failure
+cmake --build build_dev -j
+OMP_NUM_THREADS=4 OMP_PROC_BIND=false ctest --test-dir build_dev --output-on-failure   # 9 tests
 ```
-`tests/kokkos_mpi/CMakeLists.txt` is a standalone project (like flow's / dem's) and hard-codes the
-core headers as `PECLET_CORE_DIR=../../../core` (the suite sibling checkout, cache-overridable with
-`-DPECLET_CORE_DIR=`); it does NOT go through `cmake/PecletDeps.cmake`, so it only builds inside the suite
-tree. Folding it into the root CMake under a `PECLET_PNM_BUILD_TESTS` option is QUALITY_PLAN §3.D.3.
+- `pnm_single_rank` (`tests/kokkos/test_pnm.cpp`): the extraction contract on synthetic SDFs with
+  hand-derived exact counts — one spherical pore (1 pore, radius R at the integer centre, no
+  throat), two overlapping pores (2 pores + throat (1,2)), the 2×2×2 periodic solid-sphere
+  lattice (8 body-centre pores, 12 face throats, 8 solids, 76 connections) — plus staged == fused,
+  two runs bitwise equal, origin/spacing mapping, empty input.
+- `pnm_python_smoke` (`tests/python/test_smoke.py`): the same contracts through the binding
+  (catches an (Nz,Ny,Nx)/z-y-x convention slip).
+- `pnm_python_packing_ring` (`tests/python/test_packing_ring.py`): the 7199-pore / 53020-connection
+  gate on `../flow/data/packing_ring.vti`. The file is suite data, not in this repo: the script
+  exits 77 (`SKIP_RETURN_CODE`) when it is absent and ctest reports **Skipped**, never a silent
+  pass. Override the path with `-DPECLET_PNM_PACKING_RING_VTI=`.
+- `pnm_mpi_np{1,2,4}` / `pnm_flow_mpi_np{1,2,4}` (`tests/kokkos_mpi`, only with `PECLET_PNM_MPI`):
+  distributed vs single-rank oracle, bit-exact. `-DMPIEXEC_PREFLAGS=--oversubscribe` for a small
+  runner.
+The synthetic generators are shared in `tests/synthetic_sdf.hpp` (`pnm::test::`). Each
+`tests/*/CMakeLists.txt` also still configures standalone (`cmake -S tests/kokkos_mpi -B …`, core
+via `cmake/PecletDeps.cmake`, so it works outside the suite tree too).
 GPU pore-centroid caveat: nvcc FMA-contracts the centroid accumulation differently in the oracle
 vs distributed kernels, so pore POSITIONS are compared to 1e-5·spacing on CUDA (bitwise on
 OpenMP); seg ids, radii and connections are bitwise everywhere. The single-rank flood fill is

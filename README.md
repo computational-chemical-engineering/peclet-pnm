@@ -28,6 +28,13 @@ CMAKE_PREFIX_PATH="$PWD/../extern/install/nvidia-cuda" pip install .
 # Or a dev cmake build (nanobind found via the active interpreter):
 cmake -S . -B build -DCMAKE_PREFIX_PATH="$PWD/../extern/install/nvidia-cuda"
 cmake --build build -j            # -> build/peclet/pnm/_pnm.*.so ; PYTHONPATH=$PWD/build to import
+
+# Tests (one tree per backend): the single-rank C++ contract on synthetic SDFs, the Python binding
+# smoke, the 7199-pore packing_ring gate (SKIPPED by ctest when ../flow/data/packing_ring.vti is
+# absent) and, with -DPECLET_PNM_MPI=ON, the distributed np=1,2,4 suite.
+cmake -S . -B build_dev -DCMAKE_PREFIX_PATH="$PWD/../extern/install/nvidia-cuda" \
+  -DPECLET_PNM_MPI=ON -DPECLET_PNM_BUILD_TESTS=ON -DMPIEXEC_EXECUTABLE=/usr/bin/mpirun
+cmake --build build_dev -j && OMP_PROC_BIND=false ctest --test-dir build_dev --output-on-failure
 ```
 
 Without a Kokkos prefix on `CMAKE_PREFIX_PATH`, the build vendors Kokkos (OpenMP+Serial) via

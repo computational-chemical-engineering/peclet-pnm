@@ -19,36 +19,12 @@
 
 #include "pore_extraction.hpp"
 #include "pore_extraction_mpi.hpp"
+#include "../synthetic_sdf.hpp"
 
 using pnm::Index;
 using pnm::Pore;
 
 namespace {
-
-// deterministic synthetic SDFs over the global periodic grid ------------------------------------
-float sphereLatticeSdf(int gx, int gy, int gz, std::array<int, 3> gd) {
-  // 2x2x2 lattice of solid spheres (min-image periodic distance); pores at the interstices.
-  const float R = 0.22f * std::min(gd[0], std::min(gd[1], gd[2]));
-  float best = 1e30f;
-  for (int cz = 0; cz < 2; ++cz)
-    for (int cy = 0; cy < 2; ++cy)
-      for (int cx = 0; cx < 2; ++cx) {
-        const float ccx = gd[0] * (2 * cx + 1) / 4.0f, ccy = gd[1] * (2 * cy + 1) / 4.0f,
-                    ccz = gd[2] * (2 * cz + 1) / 4.0f;
-        float dx = std::fabs(gx - ccx), dy = std::fabs(gy - ccy), dz = std::fabs(gz - ccz);
-        dx = std::min(dx, gd[0] - dx);
-        dy = std::min(dy, gd[1] - dy);
-        dz = std::min(dz, gd[2] - dz);
-        best = std::min(best, std::sqrt(dx * dx + dy * dy + dz * dz) - R);
-      }
-  return best;  // negative INSIDE the spheres (solid), positive at the interstices (pore)
-}
-
-float trigSdf(int gx, int gy, int gz, std::array<int, 3> gd) {
-  const float x = 2.0f * float(M_PI) * gx / gd[0], y = 2.0f * float(M_PI) * gy / gd[1],
-              z = 2.0f * float(M_PI) * gz / gd[2];
-  return std::sin(x) * std::cos(y) + 0.7f * std::sin(2.0f * z) - 0.1f;
-}
 
 struct BlockMeta {
   int o[3], s[3];
@@ -165,8 +141,9 @@ int main(int argc, char** argv) {
   {
     Kokkos::ScopeGuard kokkos(argc, argv);
     fail += runCase("sphere_lattice", {36, 30, 24}, {0.f, 0.f, 0.f}, {1.f, 1.f, 1.f},
-                    sphereLatticeSdf, MPI_COMM_WORLD);
-    fail += runCase("trig_field", {32, 32, 32}, {-1.f, 2.f, 0.5f}, {0.5f, 1.f, 2.f}, trigSdf,
+                    pnm::test::sphereLatticeSdf, MPI_COMM_WORLD);
+    fail += runCase("trig_field", {32, 32, 32}, {-1.f, 2.f, 0.5f}, {0.5f, 1.f, 2.f},
+                    pnm::test::trigSdf,
                     MPI_COMM_WORLD);
   }
   MPI_Finalize();
