@@ -3,8 +3,9 @@ name: Quality
 # Lightweight, non-breaking code-quality gates (the suite-wide pattern, cf. morton/flow/dem). The
 # Python job hard-fails on *critical* errors only (syntax errors, undefined names, bad string
 # formatting / comparisons — the classic stop-the-build set), so it catches real bugs without
-# drowning the verify scripts in style nits. clang-format is informational until the repo-wide
-# reformat lands (QUALITY_PLAN §3.D.7).
+# drowning the verify scripts in style nits. clang-format is BLOCKING (the repo-wide reformat
+# landed; QUALITY_PLAN §3.D.7): run `clang-format -i` (18.x, the repo .clang-format) on src/ and
+# tests/ before pushing.
 
 on:
   push:
@@ -28,9 +29,8 @@ jobs:
             --exclude ".venv,venv,build,build_*,__pycache__,_deps,extern"
 
   cpp-format:
-    name: clang-format (informational)
+    name: clang-format
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
