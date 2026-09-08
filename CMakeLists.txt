@@ -43,7 +43,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(PecletDeps)
 peclet_require_kokkos()
 peclet_require_nanobind()
-peclet_sibling_include(peclet-core "${PECLET_TPX_TAG}" "../core" TPX_INC)
+peclet_sibling_include(peclet-core "${PECLET_CORE_TAG}" "../core" PECLET_CORE_INCLUDE)
 
 # pnm — pore-network extraction (Kokkos compute + pure-C++ SDFReader VTI reader).
 # NB_STATIC: bundle nanobind's runtime into the module. NOMINSIZE: nanobind's -Os is rejected by nvcc
@@ -56,7 +56,7 @@ set_target_properties(pnm PROPERTIES OUTPUT_NAME _pnm        # -> peclet.pnm._pn
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/peclet/pnm")
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/packaging/pnm_init.py
                ${CMAKE_CURRENT_BINARY_DIR}/peclet/pnm/__init__.py COPYONLY)
-target_include_directories(pnm PRIVATE src "${TPX_INC}")
+target_include_directories(pnm PRIVATE src "${PECLET_CORE_INCLUDE}")
 target_link_libraries(pnm PRIVATE Kokkos::kokkos)
 # HIP/lld strictness: nanobind's --gc-sections can drop Kokkos SharedAllocationRecord<HIPSpace>
 # vtables it only later finds referenced. Keep sections on HIP (nvcc/ld is lenient).
@@ -70,7 +70,7 @@ if(Kokkos_ENABLE_HIP)
 endif()
 
 # Distributed (MPI) extraction: compile the binding TU with the gating flag + link MPI (the core
-# grid halo lives in the header-only TPX_INC). Mirrors flow's PECLET_FLOW_MPI wiring.
+# grid halo lives in the header-only PECLET_CORE_INCLUDE). Mirrors flow's PECLET_FLOW_MPI wiring.
 if(PECLET_PNM_MPI)
   find_package(MPI REQUIRED COMPONENTS CXX)
   target_compile_definitions(pnm PRIVATE PECLET_PNM_MPI=1)

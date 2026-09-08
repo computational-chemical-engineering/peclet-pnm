@@ -84,8 +84,8 @@ cmake -S tests/kokkos_mpi -B build_kmpi -DCMAKE_PREFIX_PATH=$PWD/../extern/insta
 cmake --build build_kmpi -j && ctest --test-dir build_kmpi --output-on-failure
 ```
 `tests/kokkos_mpi/CMakeLists.txt` is a standalone project (like flow's / dem's) and hard-codes the
-core headers as `TPX_DIR=../../../core` (the suite sibling checkout, cache-overridable with
-`-DTPX_DIR=`); it does NOT go through `cmake/PecletDeps.cmake`, so it only builds inside the suite
+core headers as `PECLET_CORE_DIR=../../../core` (the suite sibling checkout, cache-overridable with
+`-DPECLET_CORE_DIR=`); it does NOT go through `cmake/PecletDeps.cmake`, so it only builds inside the suite
 tree. Folding it into the root CMake under a `PECLET_PNM_BUILD_TESTS` option is QUALITY_PLAN §3.D.3.
 GPU pore-centroid caveat: nvcc FMA-contracts the centroid accumulation differently in the oracle
 vs distributed kernels, so pore POSITIONS are compared to 1e-5·spacing on CUDA (bitwise on
