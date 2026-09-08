@@ -4,12 +4,15 @@
 /// The SDF is decomposed over ranks by the shared ORB (peclet::core::decomp::BlockDecomposer, the
 /// same deterministic partition flow/dem use) and every stage of the single-rank pipeline
 /// (pore_extraction.hpp) runs per-rank on a g=1 extended block with core's GridHalo ghost
-/// exchange. Labels are GLOBAL voxel ids (Index/int64), which makes every fixpoint
-/// decomposition-independent, so the multi-rank result is BIT-EXACT to the single-rank pipeline:
+/// exchange — the SAME stage kernels (pore_kernels.hpp), instantiated on the `BlockGeo` geometry
+/// instead of the single-rank `GridGeo`. Labels are GLOBAL voxel ids (Index/int64), which makes
+/// every fixpoint decomposition-independent, so the multi-rank result is BIT-EXACT to the
+/// single-rank pipeline. This file holds only what is distributed: the halo exchanges, the
+/// ownership/merge orchestration and the reductions:
 ///
 ///   * pore detection      — 3^3 stencil on the exchanged SDF; a rank emits the peaks it owns.
-///   * marker CCL          — local union-find over owned cells (verbatim single-rank kernels on
-///                           the owned box), then per-component min-gid, then ONE global merge:
+///   * marker CCL          — local union-find over owned cells (the single-rank kernels on the
+///                           owned box), then per-component min-gid, then ONE global merge:
 ///                           the cross-block adjacency graph on boundary labels (surface data) is
 ///                           allgathered and union-found on the host — no iteration to
 ///                           convergence. Fixpoint = min gid of the global component, the same
@@ -46,6 +49,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -58,49 +62,9 @@
 
 namespace pnm {
 
-using peclet::core::Index;
+static_assert(std::is_same_v<Index, peclet::core::Index>,
+              "pnm::Index must be core's Index (the halo exchanges carry it)");
 using peclet::core::IVec;
-
-/// Block geometry for device kernels: extended (ghost-inclusive) local box <-> global periodic
-/// grid. All members plain ints so the POD captures by value into lambdas.
-struct BlockGeo {
-  int ex, ey, ez;     // extended sizes (inner + 2g)
-  int ox, oy, oz;     // global origin of the extended box (originInclGhost; may be negative)
-  int nx, ny, nz;     // inner sizes
-  int gnx, gny, gnz;  // global dims
-  int g;              // ghost width
-
-  static KOKKOS_INLINE_FUNCTION int wrapc(int a, int n) {
-    int r = a % n;
-    return r < 0 ? r + n : r;
-  }
-  KOKKOS_INLINE_FUNCTION Index lidx(int lx, int ly, int lz) const {
-    return (Index(lz) * ey + ly) * ex + lx;
-  }
-  /// gid of the (periodically wrapped) global cell under extended-local coords.
-  KOKKOS_INLINE_FUNCTION Index gidAt(int lx, int ly, int lz) const {
-    const int gx = wrapc(ox + lx, gnx), gy = wrapc(oy + ly, gny), gz = wrapc(oz + lz, gnz);
-    return (Index(gz) * gny + gy) * gnx + gx;
-  }
-  /// gid -> extended-local linear index if the cell has an image in this extended box, else -1.
-  /// (All images of a cell carry identical values after an exchange — selfCopy covers periodic
-  /// self-images — so any image is good for reading.)
-  KOKKOS_INLINE_FUNCTION Index localOf(Index gid) const {
-    const int gx = int(gid % gnx);
-    const Index t = gid / gnx;
-    const int gy = int(t % gny), gz = int(t / gny);
-    const int lx = wrapc(gx - ox, gnx);
-    if (lx >= ex)
-      return Index(-1);
-    const int ly = wrapc(gy - oy, gny);
-    if (ly >= ey)
-      return Index(-1);
-    const int lz = wrapc(gz - oz, gnz);
-    if (lz >= ez)
-      return Index(-1);
-    return lidx(lx, ly, lz);
-  }
-};
 
 namespace detail_mpi {
 
@@ -126,21 +90,161 @@ inline std::vector<T> allgatherv(const std::vector<T>& local, MPI_Comm comm) {
   return all;
 }
 
-/// Device binary search over a sorted key array; returns the payload index or -1.
-KOKKOS_INLINE_FUNCTION Index bsearchKey(const peclet::core::View<Index>& keys, Index nkeys,
-                                        Index key) {
-  Index lo = 0, hi = nkeys - 1;
-  while (lo <= hi) {
-    const Index mid = lo + (hi - lo) / 2;
-    const Index k = keys(mid);
-    if (k == key)
-      return mid;
-    if (k < key)
-      lo = mid + 1;
-    else
-      hi = mid - 1;
+/// Sort + unique in place.
+template <class T>
+inline void sortUnique(std::vector<T>& v) {
+  std::sort(v.begin(), v.end());
+  v.erase(std::unique(v.begin(), v.end()), v.end());
+}
+
+/// The extended-block geometry of a halo topology (ghost width G) on the global grid `gdims`.
+template <class Topo>
+inline BlockGeo blockGeoOf(const Topo& topo, std::array<int, 3> gdims, int G) {
+  const auto& idxr = topo.indexer();
+  BlockGeo geo{};
+  geo.ex = (int)idxr.sizeInclGhost()[0];
+  geo.ey = (int)idxr.sizeInclGhost()[1];
+  geo.ez = (int)idxr.sizeInclGhost()[2];
+  geo.ox = (int)idxr.originInclGhost()[0];
+  geo.oy = (int)idxr.originInclGhost()[1];
+  geo.oz = (int)idxr.originInclGhost()[2];
+  geo.nx = (int)idxr.sizeInner()[0];
+  geo.ny = (int)idxr.sizeInner()[1];
+  geo.nz = (int)idxr.sizeInner()[2];
+  geo.gnx = gdims[0];
+  geo.gny = gdims[1];
+  geo.gnz = gdims[2];
+  geo.g = G;
+  return geo;
+}
+
+/// Stage a host inner block (x-fastest, no ghosts) onto a fresh extended device field (ghosts
+/// zero-initialised); the caller exchanges.
+template <class T>
+inline peclet::core::View<T> stageInner(const Exec& space, const BlockGeo& geo,
+                                        const std::vector<T>& h, const char* name) {
+  const BlockGeo g = geo;
+  peclet::core::View<T> e(name, g.numExt());
+  Kokkos::View<T*, Mem> i0("pnm::mpi::stage_in", g.numOwned());
+  uploadVec(h, i0);
+  Kokkos::parallel_for(
+      "pnm::mpi::stage", kernels::ownedRange(space, g), KOKKOS_LAMBDA(int ix, int iy, int iz) {
+        e(g.cell(ix + g.g, iy + g.g, iz + g.g)) = i0(g.owned(ix, iy, iz));
+      });
+  space.fence();
+  return e;
+}
+
+/// Pack the owned box of an extended device field into a host vector.
+template <class T>
+inline std::vector<T> packInner(const Exec& space, const BlockGeo& geo,
+                                const peclet::core::View<T>& e) {
+  const BlockGeo g = geo;
+  Kokkos::View<T*, Mem> i0("pnm::mpi::pack", g.numOwned());
+  Kokkos::parallel_for(
+      "pnm::mpi::seg_pack", kernels::ownedRange(space, g), KOKKOS_LAMBDA(int ix, int iy, int iz) {
+        i0(g.owned(ix, iy, iz)) = e(g.cell(ix + g.g, iy + g.g, iz + g.g));
+      });
+  space.fence();
+  return downloadN(i0, g.numOwned());
+}
+
+/// Interleaved device (a,b) Index pairs -> host list, locally sorted/unique.
+template <class PairView>
+inline std::vector<std::pair<Index, Index>> localPairs(const PairView& d, std::size_t count) {
+  std::vector<Index> flat = downloadN(d, 2 * count);
+  std::vector<std::pair<Index, Index>> loc(count);
+  for (std::size_t i = 0; i < count; ++i)
+    loc[i] = {flat[2 * i], flat[2 * i + 1]};
+  sortUnique(loc);
+  return loc;
+}
+
+/// ONE global merge of a cross-block equivalence graph: the local (a,b) pairs are allgathered
+/// and union-found on the host (union-by-min-gid: the class root is the min gid, matching the
+/// single-rank fixpoint; deterministic on every rank — identical input). Returns the
+/// (key -> root) remap for every key that is not its own root, as sorted device key/value views
+/// for kernels::bsearchKey (`nk` = 0 when nothing merges).
+struct MergeRemap {
+  peclet::core::View<Index> keys, roots;
+  Index nk = 0;
+};
+inline MergeRemap globalMerge(const std::vector<std::pair<Index, Index>>& loc, MPI_Comm comm) {
+  auto all = allgatherv(loc, comm);
+  std::map<Index, Index> par;
+  auto find = [&par](Index x) {
+    while (true) {
+      auto it = par.find(x);
+      if (it == par.end() || it->second == x)
+        return x;
+      x = it->second;
+    }
+  };
+  for (const auto& pr : all) {
+    const Index ra = find(pr.first), rb = find(pr.second);
+    if (ra == rb)
+      continue;
+    const Index lo = ra < rb ? ra : rb, hi = ra < rb ? rb : ra;
+    par[hi] = lo;
+    par.emplace(lo, lo);
   }
-  return Index(-1);
+  std::vector<Index> rkeys, rvals;
+  for (const auto& kv : par) {
+    const Index root = find(kv.first);
+    if (root != kv.first) {
+      rkeys.push_back(kv.first);  // std::map order: ascending keys, as bsearchKey needs
+      rvals.push_back(root);
+    }
+  }
+  MergeRemap m;
+  m.nk = Index(rkeys.size());
+  m.keys = peclet::core::View<Index>("pnm::mpi::rk", rkeys.size());
+  m.roots = peclet::core::View<Index>("pnm::mpi::rv", rvals.size());
+  uploadVec(rkeys, m.keys);
+  uploadVec(rvals, m.roots);
+  return m;
+}
+
+/// Apply a MergeRemap to the entries of `field` selected by `pred(i)`: label -> its class root.
+template <class FieldView, class PredFn>
+inline void applyRemap(const Exec& space, const MergeRemap& m, const FieldView& field,
+                       std::size_t n, const PredFn& pred) {
+  if (m.nk == 0)
+    return;
+  const auto dk = m.keys;
+  const auto dv = m.roots;
+  const Index nk = m.nk;
+  Kokkos::parallel_for(
+      "pnm::mpi::apply_merge", kernels::R1(space, 0, n), KOKKOS_LAMBDA(std::size_t i) {
+        if (!pred(i))
+          return;
+        const Index k = kernels::bsearchKey(dk, nk, field(i));
+        if (k >= 0)
+          field(i) = dv(k);
+      });
+  space.fence();
+}
+
+/// Cross-rank fixpoint of the hold-at-ghost pointer jumping (kernels::resolveHoldAtGhost):
+/// exchange the state field, resolve one round on every rank, Allreduce the pending count, until
+/// no cell is pending. Progress is guaranteed (every pending chain finalizes one cross-block hop
+/// per round); the round cap is a collective guard.
+template <class Halo, class TargetView>
+inline void resolveToFixpoint(const Exec& space, const BlockGeo& geo, Halo& halo,
+                              const TargetView& target, MPI_Comm comm, const char* what) {
+  int rounds = 0;
+  for (;;) {
+    halo.exchange(target);
+    const int pending = kernels::resolveHoldAtGhost(space, geo, target);
+    int globalPending = 0;
+    MPI_Allreduce(&pending, &globalPending, 1, MPI_INT, MPI_SUM, comm);
+    if (!globalPending)
+      break;
+    if (++rounds > 100000) {
+      // collective: the round count and the Allreduce'd stop are identical on every rank
+      throw std::runtime_error(std::string("[pnm::mpi] ") + what + " did not converge");
+    }
+  }
 }
 
 /// Per-rank (key -> min value) reduction on device via UnorderedMap, with capacity-retry.
@@ -239,6 +343,7 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
                                                std::array<float, 3> origin,
                                                std::array<float, 3> spacing, MPI_Comm comm) {
   namespace dm = detail_mpi;
+  namespace kn = kernels;
   using peclet::core::View;
   using peclet::core::halo::GridHalo;
   using peclet::core::halo::GridHaloTopology;
@@ -260,27 +365,13 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
   GridHalo<int> haloS;
   haloS.init(topo);
 
-  const auto& idxr = topo.indexer();
-  BlockGeo geo{};
-  geo.ex = (int)idxr.sizeInclGhost()[0];
-  geo.ey = (int)idxr.sizeInclGhost()[1];
-  geo.ez = (int)idxr.sizeInclGhost()[2];
-  geo.ox = (int)idxr.originInclGhost()[0];
-  geo.oy = (int)idxr.originInclGhost()[1];
-  geo.oz = (int)idxr.originInclGhost()[2];
-  geo.nx = (int)idxr.sizeInner()[0];
-  geo.ny = (int)idxr.sizeInner()[1];
-  geo.nz = (int)idxr.sizeInner()[2];
-  geo.gnx = gdims[0];
-  geo.gny = gdims[1];
-  geo.gnz = gdims[2];
-  geo.g = G;
-
+  const BlockGeo geo = dm::blockGeoOf(topo, gdims, G);
+  const BlockGeo g = geo;
   MpiPoreNetwork out;
   out.block_origin = {geo.ox + G, geo.oy + G, geo.oz + G};
   out.block_size = {geo.nx, geo.ny, geo.nz};
-  const std::size_t nInner = std::size_t(geo.nx) * geo.ny * geo.nz;
-  const std::size_t nExt = std::size_t(geo.ex) * geo.ey * geo.ez;
+  const std::size_t nInner = geo.numOwned();
+  const std::size_t nExt = geo.numExt();
   // A caller-side size error is rank-local, but everything below is collective: agree on it
   // first so every rank throws together instead of the good ranks hanging in the next exchange.
   {
@@ -296,85 +387,21 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
   }
 
   Exec space;
-  using MD3 = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
-  const auto inner = MD3(space, {0, 0, 0}, {geo.nx, geo.ny, geo.nz});
-  const auto ext = MD3(space, {0, 0, 0}, {geo.ex, geo.ey, geo.ez});
+  const auto inner = kn::ownedRange(space, geo);
+  const auto ext = kn::MD3(space, {0, 0, 0}, {geo.ex, geo.ey, geo.ez});
 
   // ---- SDF onto the extended block + one exchange ----
-  View<float> sdfE("pnm::mpi::sdfE", nExt);
-  {
-    View<float> sdfI("pnm::mpi::sdfI", nInner);
-    uploadVec(sdf_local, sdfI);
-    const BlockGeo g = geo;
-    Kokkos::parallel_for(
-        "pnm::mpi::sdf_stage", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          sdfE(g.lidx(ix + 1, iy + 1, iz + 1)) = sdfI((Index(iz) * g.ny + iy) * g.nx + ix);
-        });
-    space.fence();
-  }
+  View<float> sdfE = dm::stageInner(space, geo, sdf_local, "pnm::mpi::sdfE");
   haloF.exchange(sdfE);
 
   // ---- pore detection (owned peaks under the global (sdf, gid) tie-break) ----
   {
-    const BlockGeo g = geo;
-    const float ox = origin[0], oy = origin[1], oz = origin[2];
-    const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
     const int max_pores = 1000000;
     View<Pore> pores("pnm::mpi::pores", max_pores);
     Kokkos::View<int, Mem> counter("pnm::mpi::pore_count");
     Kokkos::deep_copy(counter, 0);
-    Kokkos::parallel_for(
-        "pnm::mpi::extract_pores", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-          const Index ci = g.lidx(lx, ly, lz);
-          const float cv = sdfE(ci);
-          if (cv <= 0.0f)
-            return;
-          const Index cgid = g.gidAt(lx, ly, lz);
-          bool peak = true;
-          for (int dz = -1; dz <= 1 && peak; ++dz)
-            for (int dy = -1; dy <= 1 && peak; ++dy)
-              for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0 && dz == 0)
-                  continue;
-                const float nv = sdfE(g.lidx(lx + dx, ly + dy, lz + dz));
-                const Index ngid = g.gidAt(lx + dx, ly + dy, lz + dz);
-                if (nv > cv || (nv == cv && ngid > cgid)) {
-                  peak = false;
-                  break;
-                }
-              }
-          if (!peak)
-            return;
-          float sw = 0.0f, px = 0.0f, py = 0.0f, pz = 0.0f;
-          for (int dz = -1; dz <= 1; ++dz)
-            for (int dy = -1; dy <= 1; ++dy)
-              for (int dx = -1; dx <= 1; ++dx) {
-                const float v = sdfE(g.lidx(lx + dx, ly + dy, lz + dz));
-                float w = v > 0.0f ? v : 0.0f;
-                w = w * w;
-                sw += w;
-                px += dx * w;
-                py += dy * w;
-                pz += dz * w;
-              }
-          float fx = 0, fy = 0, fz = 0;
-          if (sw > 1e-6f) {
-            fx = px / sw;
-            fy = py / sw;
-            fz = pz / sw;
-          }
-          // Global (wrapped) integer coords -> identical float positions to the single rank.
-          const int gx = BlockGeo::wrapc(g.ox + lx, g.gnx), gy = BlockGeo::wrapc(g.oy + ly, g.gny),
-                    gz = BlockGeo::wrapc(g.oz + lz, g.gnz);
-          const int slot = Kokkos::atomic_fetch_add(&counter(), 1);
-          if (slot < max_pores)
-            pores(slot) = Pore{ox + (gx + fx) * sx, oy + (gy + fy) * sy, oz + (gz + fz) * sz, cv};
-        });
-    space.fence();
-    auto hc = Kokkos::create_mirror_view(counter);
-    Kokkos::deep_copy(hc, counter);
-    out.pores = downloadN(pores, std::min<std::size_t>(hc(), max_pores));
+    kn::detectPores(space, geo, sdfE, origin, spacing, pores, counter, max_pores);
+    out.pores = downloadN(pores, std::min<std::size_t>(readScalar(counter), max_pores));
   }
 
   // ---- markers + LOCAL union-find CCL over the owned box (single-rank kernels, owned indices) --
@@ -385,81 +412,26 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
   {
     Kokkos::View<int*, Mem> parent("pnm::mpi::parent", nInner);
     Kokkos::View<int, Mem> changed("pnm::mpi::changed");
-    const BlockGeo g = geo;
-    Kokkos::parallel_for(
-        "pnm::mpi::init_markers", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-          parent(o) = (sdfE(g.lidx(ix + 1, iy + 1, iz + 1)) < thr) ? int(o) : -1;
-        });
-    space.fence();
-    auto flatten = [&]() {
-      Kokkos::parallel_for(
-          "pnm::mpi::flatten", Kokkos::RangePolicy<Exec>(space, 0, nInner),
-          KOKKOS_LAMBDA(std::size_t o) {
-            int l = parent(o);
-            if (l != -1) {
-              while (l != parent(l))
-                l = parent(l);
-              parent(o) = l;
-            }
-          });
-      space.fence();
-    };
-    int h_changed = 1;
-    while (h_changed) {
-      Kokkos::deep_copy(changed, 0);
-      Kokkos::parallel_for(
-          "pnm::mpi::merge_markers", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-            const int my = parent(o);
-            if (my == -1)
-              return;
-            const int dz_l[13] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0};
-            const int dy_l[13] = {-1, -1, -1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0};
-            const int dx_l[13] = {-1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, 1};
-            for (int k = 0; k < 13; ++k) {
-              const int jx = ix + dx_l[k], jy = iy + dy_l[k], jz = iz + dz_l[k];
-              if (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 || jz >= g.nz)
-                continue;  // cross-block adjacency goes through the boundary graph
-              const int nl = parent((Index(jz) * g.ny + jy) * g.nx + jx);
-              if (nl != -1 && my != nl) {
-                int rm = my;
-                while (rm != parent(rm))
-                  rm = parent(rm);
-                int rn = nl;
-                while (rn != parent(rn))
-                  rn = parent(rn);
-                if (rm != rn) {
-                  const int small = rm < rn ? rm : rn, large = rm < rn ? rn : rm;
-                  Kokkos::atomic_min(&parent(large), small);
-                  changed() = 1;
-                }
-              }
-            }
-          });
-      space.fence();
-      flatten();
-      auto hc = Kokkos::create_mirror_view(changed);
-      Kokkos::deep_copy(hc, changed);
-      h_changed = hc();
-    }
+    kn::initMarkers(space, geo, sdfE, thr, parent);
+    kn::cclFixpoint(space, parent, nInner, changed,
+                    [&]() { kn::cclMergeMarkers(space, geo, parent, changed); });
     // Per-component min gid -> the component label (what the single-rank atomic_min CCL yields
     // when parents are voxel ids), scattered onto the extended label field.
     View<Index> mg("pnm::mpi::mg", nInner);
     Kokkos::deep_copy(mg, Index(0x7fffffffffffffffLL));
     Kokkos::parallel_for(
         "pnm::mpi::ccl_mingid", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+          const Index o = g.owned(ix, iy, iz);
           if (parent(o) != -1)
-            Kokkos::atomic_min(&mg(parent(o)), g.gidAt(ix + 1, iy + 1, iz + 1));
+            Kokkos::atomic_min(&mg(parent(o)), g.gid(ix + 1, iy + 1, iz + 1));
         });
     space.fence();
     Kokkos::parallel_for(
         "pnm::mpi::ccl_scatter", ext, KOKKOS_LAMBDA(int lx, int ly, int lz) {
-          const Index e = g.lidx(lx, ly, lz);
+          const Index e = g.cell(lx, ly, lz);
           const int ix = lx - 1, iy = ly - 1, iz = lz - 1;
-          if (ix >= 0 && ix < g.nx && iy >= 0 && iy < g.ny && iz >= 0 && iz < g.nz) {
-            const int p = parent((Index(iz) * g.ny + iy) * g.nx + ix);
+          if (g.inOwned(ix, iy, iz)) {
+            const int p = parent(g.owned(ix, iy, iz));
             labelE(e) = (p == -1) ? Index(-1) : mg(p);
           } else {
             labelE(e) = -1;
@@ -471,7 +443,6 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
 
   // ---- global merge: boundary equivalence graph, allgathered, union-found on the host ----
   {
-    const BlockGeo g = geo;
     const Index maxPairs = Index(nInner) * 4 + 1024;
     View<Index> bpairs("pnm::mpi::bpairs", std::size_t(2 * maxPairs));
     Kokkos::View<int, Mem> bcnt("pnm::mpi::bcnt");
@@ -479,10 +450,10 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
     Kokkos::parallel_for(
         "pnm::mpi::boundary_pairs", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
           // Only owned cells within one cell of a block face can see a ghost.
-          if (ix > 0 && ix < g.nx - 1 && iy > 0 && iy < g.ny - 1 && iz > 0 && iz < g.nz - 1)
+          if (!g.onSurface(ix, iy, iz))
             return;
           const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-          const Index my = labelE(g.lidx(lx, ly, lz));
+          const Index my = labelE(g.cell(lx, ly, lz));
           if (my == -1)
             return;
           for (int dz = -1; dz <= 1; ++dz)
@@ -490,12 +461,9 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
               for (int dx = -1; dx <= 1; ++dx) {
                 if (dx == 0 && dy == 0 && dz == 0)
                   continue;
-                const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                const bool ghost = (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 ||
-                                    jz >= g.nz);  // neighbour outside the owned box
-                if (!ghost)
-                  continue;
-                const Index nl = labelE(g.lidx(lx + dx, ly + dy, lz + dz));
+                if (g.inOwned(ix + dx, iy + dy, iz + dz))
+                  continue;  // owned-owned adjacency was the local CCL's job
+                const Index nl = labelE(g.cell(lx + dx, ly + dy, lz + dz));
                 if (nl == -1 || nl == my)
                   continue;
                 const int s = Kokkos::atomic_fetch_add(&bcnt(), 1);
@@ -506,103 +474,24 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
               }
         });
     space.fence();
-    auto hc = Kokkos::create_mirror_view(bcnt);
-    Kokkos::deep_copy(hc, bcnt);
-    std::vector<Index> flat = downloadN(bpairs, std::size_t(2 * std::min<Index>(hc(), maxPairs)));
-    // Local dedupe before the allgather.
-    std::vector<std::pair<Index, Index>> loc(flat.size() / 2);
-    for (std::size_t i = 0; i < loc.size(); ++i)
-      loc[i] = {flat[2 * i], flat[2 * i + 1]};
-    std::sort(loc.begin(), loc.end());
-    loc.erase(std::unique(loc.begin(), loc.end()), loc.end());
-    auto all = dm::allgatherv(loc, comm);
-    // Host union-find, union-by-min-gid: the class root is the min gid, matching the single-rank
-    // fixpoint. Deterministic on every rank (identical input).
-    std::map<Index, Index> par;
-    auto find = [&par](Index x) {
-      while (true) {
-        auto it = par.find(x);
-        if (it == par.end() || it->second == x)
-          return x;
-        x = it->second;
-      }
-    };
-    for (const auto& pr : all) {
-      const Index ra = find(pr.first), rb = find(pr.second);
-      if (ra == rb)
-        continue;
-      const Index lo = ra < rb ? ra : rb, hi = ra < rb ? rb : ra;
-      par[hi] = lo;
-      par.emplace(lo, lo);
-    }
-    std::vector<Index> rkeys, rvals;
-    for (const auto& kv : par) {
-      const Index root = find(kv.first);
-      if (root != kv.first) {
-        rkeys.push_back(kv.first);
-        rvals.push_back(root);
-      }
-    }
-    if (!rkeys.empty()) {
-      View<Index> dk("pnm::mpi::rk", rkeys.size()), dv("pnm::mpi::rv", rvals.size());
-      uploadVec(rkeys, dk);
-      uploadVec(rvals, dv);
-      const Index nk = Index(rkeys.size());
-      Kokkos::parallel_for(
-          "pnm::mpi::apply_merge", ext, KOKKOS_LAMBDA(int lx, int ly, int lz) {
-            const Index e = g.lidx(lx, ly, lz);
-            const Index l = labelE(e);
-            if (l == -1)
-              return;
-            const Index k = dm::bsearchKey(dk, nk, l);
-            if (k >= 0)
-              labelE(e) = dv(k);
-          });
-      space.fence();
-    }
+    const auto loc =
+        dm::localPairs(bpairs, std::size_t(std::min<Index>(readScalar(bcnt), maxPairs)));
+    const dm::MergeRemap merge = dm::globalMerge(loc, comm);
+    dm::applyRemap(
+        space, merge, labelE, nExt, KOKKOS_LAMBDA(std::size_t e) { return labelE(e) != -1; });
   }
   haloI.exchange(labelE);
 
   // ---- flood fill of the shallow solid: Jacobi sweeps, exchange + Allreduce per sweep ----
   {
-    const BlockGeo g = geo;
     View<Index> labelN("pnm::mpi::labelN", nExt);
     Kokkos::View<int, Mem> changed("pnm::mpi::fchanged");
-    int h_changed = 1;
-    while (h_changed) {
-      Kokkos::deep_copy(changed, 0);
-      Kokkos::deep_copy(labelN, labelE);
-      Kokkos::parallel_for(
-          "pnm::mpi::flood", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-            const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-            const Index e = g.lidx(lx, ly, lz);
-            if (sdfE(e) >= 0.0f)
-              return;  // pore: ignore
-            if (labelE(e) != -1)
-              return;  // already labelled
-            Index best = -1;
-            for (int dz = -1; dz <= 1; ++dz)
-              for (int dy = -1; dy <= 1; ++dy)
-                for (int dx = -1; dx <= 1; ++dx) {
-                  if (dx == 0 && dy == 0 && dz == 0)
-                    continue;
-                  const Index nl = labelE(g.lidx(lx + dx, ly + dy, lz + dz));
-                  if (nl != -1 && (best == -1 || nl < best))
-                    best = nl;
-                }
-            if (best != -1) {
-              labelN(e) = best;
-              changed() = 1;
-            }
-          });
-      space.fence();
-      std::swap(labelE, labelN);
-      auto hc = Kokkos::create_mirror_view(changed);
-      Kokkos::deep_copy(hc, changed);
-      h_changed = dm::allreduceMaxInt(hc(), comm);
-      if (h_changed)
+    kn::floodFixpoint(space, geo, sdfE, labelE, labelN, changed, [&](int c) {
+      const int gc = dm::allreduceMaxInt(c, comm);
+      if (gc)
         haloI.exchange(labelE);
-    }
+      return gc;
+    });
   }
 
   // ---- gradient-path pore roots: steepest-neighbour forest + cross-rank root resolution ----
@@ -615,94 +504,27 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
   // cross-block hop per round — guaranteed progress, loop until no cell is pending.
   View<Index> targetE("pnm::mpi::targetE", nExt);
   {
-    const BlockGeo g = geo;
     Kokkos::deep_copy(targetE, Index(-1));
-    Kokkos::parallel_for(
-        "pnm::mpi::grad_step", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-          const Index ci = g.lidx(lx, ly, lz);
-          const Index cgid = g.gidAt(lx, ly, lz);
-          if (sdfE(ci) <= 0.0f) {  // solids: self-root (their basins are unused, as single-rank)
-            targetE(ci) = ~cgid;
-            return;
-          }
-          Index best = cgid;
-          float bv = sdfE(ci);
-          for (int dz = -1; dz <= 1; ++dz)
-            for (int dy = -1; dy <= 1; ++dy)
-              for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0 && dz == 0)
-                  continue;
-                const float nv = sdfE(g.lidx(lx + dx, ly + dy, lz + dz));
-                const Index ngid = g.gidAt(lx + dx, ly + dy, lz + dz);
-                if (nv > bv) {
-                  bv = nv;
-                  best = ngid;
-                } else if (nv == bv && ngid > best)
-                  best = ngid;
-              }
-          targetE(ci) = (best == cgid) ? ~cgid : best;  // peak: finalized self-root
-        });
-    space.fence();
-    int rounds = 0;
-    for (;;) {
-      haloI.exchange(targetE);
-      int pending = 0;
-      Kokkos::parallel_reduce(
-          "pnm::mpi::resolve_roots", Kokkos::RangePolicy<Exec>(space, 0, nInner),
-          KOKKOS_LAMBDA(std::size_t o, int& pend) {
-            const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
-                      iz = int(o / (Index(g.nx) * g.ny));
-            const Index ci = g.lidx(ix + 1, iy + 1, iz + 1);
-            Index t = targetE(ci);
-            if (t < 0)
-              return;  // finalized
-            for (int s = 0; s < 64; ++s) {
-              const Index tl = g.localOf(t);  // in-block by invariant
-              if (tl < 0)
-                break;
-              const Index tv = targetE(tl);
-              if (tv < 0) {  // that cell knows its root: adopt, finalized
-                t = tv;
-                break;
-              }
-              const Index nl = g.localOf(tv);
-              if (nl < 0)
-                break;  // next hop leaves the block: hold at tl, wait for its owner
-              t = tv;   // advance within the block
-            }
-            if (t != targetE(ci))
-              targetE(ci) = t;
-            if (t >= 0)
-              pend += 1;
-          },
-          pending);
-      space.fence();
-      int globalPending = 0;
-      MPI_Allreduce(&pending, &globalPending, 1, MPI_INT, MPI_SUM, comm);
-      if (!globalPending)
-        break;
-      if (++rounds > 100000) {
-        // collective: the round count and the Allreduce'd stop are identical on every rank
-        throw std::runtime_error("[pnm::mpi] gradient-root resolution did not converge");
-      }
-    }
+    kn::forestInit(
+        space, geo, sdfE, targetE, KOKKOS_LAMBDA(Index ci) { return sdfE(ci) > 0.0f; },
+        KOKKOS_LAMBDA(Index, Index cgid) { return ~cgid; },   // solids: self-root (unused)
+        KOKKOS_LAMBDA(Index, Index cgid) { return ~cgid; });  // peak: finalized self-root
+    dm::resolveToFixpoint(space, geo, haloI, targetE, comm, "gradient-root resolution");
   }
 
   // ---- global renumbering (single-rank first-encounter order == ascending min-appearance gid) --
   View<int> segE("pnm::mpi::segE", nExt);
   {
-    const BlockGeo g = geo;
     // Pore roots: per-rank (root -> min appearance gid), then a global min-reduce.
     auto locPores = dm::minByKey(
         nInner, KOKKOS_LAMBDA(std::size_t o, Index & k, Index & v) {
-          const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
-                    iz = int(o / (Index(g.nx) * g.ny));
-          const Index e = g.lidx(ix + 1, iy + 1, iz + 1);
+          int ix, iy, iz;
+          g.ownedCoords(Index(o), ix, iy, iz);
+          const Index e = g.cell(ix + 1, iy + 1, iz + 1);
           if (sdfE(e) <= 0.0f)
             return false;
           k = ~targetE(e);  // finalized state stores ~root
-          v = g.gidAt(ix + 1, iy + 1, iz + 1);
+          v = g.gid(ix + 1, iy + 1, iz + 1);
           return true;
         });
     // Solid labels: min appearance gid over ALL labelled voxels (a flood-filled shallow voxel can
@@ -710,13 +532,13 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
     // appearance).
     auto locSolids = dm::minByKey(
         nInner, KOKKOS_LAMBDA(std::size_t o, Index & k, Index & v) {
-          const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
-                    iz = int(o / (Index(g.nx) * g.ny));
-          const Index e = g.lidx(ix + 1, iy + 1, iz + 1);
+          int ix, iy, iz;
+          g.ownedCoords(Index(o), ix, iy, iz);
+          const Index e = g.cell(ix + 1, iy + 1, iz + 1);
           if (sdfE(e) > 0.0f || labelE(e) == -1)
             return false;
           k = labelE(e);
-          v = g.gidAt(ix + 1, iy + 1, iz + 1);
+          v = g.gid(ix + 1, iy + 1, iz + 1);
           return true;
         });
     auto allPores = dm::allgatherv(locPores, comm);
@@ -768,13 +590,13 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
     Kokkos::deep_copy(segE, 0);
     Kokkos::parallel_for(
         "pnm::mpi::seg_assign", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const Index e = g.lidx(ix + 1, iy + 1, iz + 1);
+          const Index e = g.cell(ix + 1, iy + 1, iz + 1);
           int id = 0;
           if (sdfE(e) > 0.0f) {
-            const Index k = dm::bsearchKey(dpk, npk, ~targetE(e));
+            const Index k = kn::bsearchKey(dpk, npk, ~targetE(e));
             id = (k >= 0) ? dpv(k) : 0;
           } else if (labelE(e) != -1) {
-            const Index k = dm::bsearchKey(dsk, nsk, labelE(e));
+            const Index k = kn::bsearchKey(dsk, nsk, labelE(e));
             id = (k >= 0) ? dsv(k) : 0;
           }
           segE(e) = id;
@@ -785,53 +607,19 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
 
   // ---- topology: local (+x/+y/+z) pairs against exchanged seg ghosts, global sort/unique ----
   {
-    const BlockGeo g = geo;
     const Index maxPairs = Index(nInner) * 3;
     Kokkos::View<int*, Mem> pairs("pnm::mpi::pairs", std::size_t(2 * maxPairs));
     Kokkos::View<int, Mem> cnt("pnm::mpi::tcnt");
     Kokkos::deep_copy(cnt, 0);
-    Kokkos::parallel_for(
-        "pnm::mpi::topology", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-          const int my = segE(g.lidx(lx, ly, lz));
-          const int dx_l[3] = {1, 0, 0}, dy_l[3] = {0, 1, 0}, dz_l[3] = {0, 0, 1};
-          for (int k = 0; k < 3; ++k) {
-            const int nl = segE(g.lidx(lx + dx_l[k], ly + dy_l[k], lz + dz_l[k]));
-            if (my != nl) {
-              const int s = Kokkos::atomic_fetch_add(&cnt(), 1);
-              if (s < maxPairs) {
-                pairs(2 * s) = my < nl ? my : nl;
-                pairs(2 * s + 1) = my < nl ? nl : my;
-              }
-            }
-          }
-        });
-    space.fence();
-    auto hc = Kokkos::create_mirror_view(cnt);
-    Kokkos::deep_copy(hc, cnt);
-    std::vector<int> flat = downloadN(pairs, std::size_t(2 * std::min<Index>(hc(), maxPairs)));
-    std::vector<std::pair<int, int>> loc(flat.size() / 2);
-    for (std::size_t i = 0; i < loc.size(); ++i)
-      loc[i] = {flat[2 * i], flat[2 * i + 1]};
-    std::sort(loc.begin(), loc.end());
-    loc.erase(std::unique(loc.begin(), loc.end()), loc.end());
+    kn::boundaryPairs(space, geo, segE, pairs, cnt, maxPairs);
+    auto loc = kn::uniquePairs(pairs, std::size_t(std::min<Index>(readScalar(cnt), maxPairs)));
     auto all = dm::allgatherv(loc, comm);
-    std::sort(all.begin(), all.end());
-    all.erase(std::unique(all.begin(), all.end()), all.end());
+    dm::sortUnique(all);
     out.connections = std::move(all);
   }
 
   // ---- download this rank's inner seg block ----
-  {
-    const BlockGeo g = geo;
-    Kokkos::View<int*, Mem> segI("pnm::mpi::segI", nInner);
-    Kokkos::parallel_for(
-        "pnm::mpi::seg_pack", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          segI((Index(iz) * g.ny + iy) * g.nx + ix) = segE(g.lidx(ix + 1, iy + 1, iz + 1));
-        });
-    space.fence();
-    out.seg = downloadN(segI, nInner);
-  }
+  out.seg = dm::packInner(space, geo, segE);
   return out;
 }
 
@@ -853,6 +641,7 @@ inline NetworkFlow extract_network_flow_mpi(
     const std::vector<double>& oy_h, const std::vector<double>& oz_h, std::array<double, 3> grad_p,
     MPI_Comm comm) {
   namespace dm = detail_mpi;
+  namespace kn = kernels;
   using peclet::core::View;
   using peclet::core::halo::GridHalo;
   using peclet::core::halo::GridHaloTopology;
@@ -878,79 +667,29 @@ inline NetworkFlow extract_network_flow_mpi(
   GridHalo<double> haloD;
   haloD.init(topo);
 
-  const auto& idxr = topo.indexer();
-  BlockGeo geo{};
-  geo.ex = (int)idxr.sizeInclGhost()[0];
-  geo.ey = (int)idxr.sizeInclGhost()[1];
-  geo.ez = (int)idxr.sizeInclGhost()[2];
-  geo.ox = (int)idxr.originInclGhost()[0];
-  geo.oy = (int)idxr.originInclGhost()[1];
-  geo.oz = (int)idxr.originInclGhost()[2];
-  geo.nx = (int)idxr.sizeInner()[0];
-  geo.ny = (int)idxr.sizeInner()[1];
-  geo.nz = (int)idxr.sizeInner()[2];
-  geo.gnx = gdims[0];
-  geo.gny = gdims[1];
-  geo.gnz = gdims[2];
-  geo.g = G;
-  const std::size_t nInner = std::size_t(geo.nx) * geo.ny * geo.nz;
-  const std::size_t nExt = std::size_t(geo.ex) * geo.ey * geo.ez;
-  Exec space;
-  using MD3 = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
-  using R1 = Kokkos::RangePolicy<Exec>;
-  const auto inner = MD3(space, {0, 0, 0}, {geo.nx, geo.ny, geo.nz});
+  const BlockGeo geo = dm::blockGeoOf(topo, gdims, G);
   const BlockGeo g = geo;
+  const std::size_t nInner = geo.numOwned();
+  const std::size_t nExt = geo.numExt();
+  Exec space;
+  using R1 = kn::R1;
+  const auto inner = kn::ownedRange(space, geo);
 
   // 2. stage sdf / seg / fields onto the extended block + exchange
-  auto stageF = [&](const std::vector<float>& h) {
-    View<float> e("nf::mpi::f", nExt), i0("nf::mpi::fi", nInner);
-    uploadVec(h, i0);
-    Kokkos::parallel_for(
-        "pnm::nfmpi::stageF", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          e(g.lidx(ix + 1, iy + 1, iz + 1)) = i0((Index(iz) * g.ny + iy) * g.nx + ix);
-        });
-    space.fence();
-    return e;
-  };
-  auto stageI = [&](const std::vector<int>& h) {
-    View<int> e("nf::mpi::s", nExt);
-    Kokkos::View<int*, Mem> i0("nf::mpi::si", nInner);
-    uploadVec(h, i0);
-    Kokkos::parallel_for(
-        "pnm::nfmpi::stageI", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          e(g.lidx(ix + 1, iy + 1, iz + 1)) = i0((Index(iz) * g.ny + iy) * g.nx + ix);
-        });
-    space.fence();
-    return e;
-  };
-  auto stageD = [&](const std::vector<double>& h, bool required) {
-    View<double> e("nf::mpi::d", (required || !h.empty()) ? nExt : 0);
-    if (h.empty())
-      return e;
-    View<double> i0("nf::mpi::di", nInner);
-    uploadVec(h, i0);
-    Kokkos::parallel_for(
-        "pnm::nfmpi::stageD", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          e(g.lidx(ix + 1, iy + 1, iz + 1)) = i0((Index(iz) * g.ny + iy) * g.nx + ix);
-        });
-    space.fence();
-    return e;
-  };
-  View<float> sdfE = stageF(sdf_local);
+  View<float> sdfE = dm::stageInner(space, geo, sdf_local, "nf::mpi::f");
   haloF.exchange(sdfE);
-  View<int> segE = stageI(base.seg);
+  View<int> segE = dm::stageInner(space, geo, base.seg, "nf::mpi::s");
   haloS.exchange(segE);
+  auto stageD = [&](const std::vector<double>& h, bool required) {
+    if (h.empty())
+      return View<double>("nf::mpi::d", required ? nExt : 0);
+    View<double> e = dm::stageInner(space, geo, h, "nf::mpi::d");
+    haloD.exchange(e);
+    return e;
+  };
   View<double> uE = stageD(u_h, true), vE = stageD(v_h, true), wE = stageD(w_h, true);
-  haloD.exchange(uE);
-  haloD.exchange(vE);
-  haloD.exchange(wE);
   const bool hasOpen = !ox_h.empty();
   View<double> oxE = stageD(ox_h, false), oyE = stageD(oy_h, false), ozE = stageD(oz_h, false);
-  if (hasOpen) {
-    haloD.exchange(oxE);
-    haloD.exchange(oyE);
-    haloD.exchange(ozE);
-  }
 
   // 3. flow-basin labels for EVERY cell: propagate the LABEL along the steepest-ascent forest.
   // State per cell (Index field): finalized = -(label+1) (label 0 = enclosed solid basin, no
@@ -960,76 +699,11 @@ inline NetworkFlow extract_network_flow_mpi(
   View<Index> labWork("pnm::nfmpi::labWork", nExt);
   {
     Kokkos::deep_copy(labWork, Index(-1));  // ghosts: "finalized, label 0" until exchanged
-    Kokkos::parallel_for(
-        "pnm::nfmpi::basin_init", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-          const Index ci = g.lidx(lx, ly, lz);
-          if (sdfE(ci) > 0.0f) {  // pore cell: basin label is its own segmentation label
-            labWork(ci) = -(Index(segE(ci)) + 1);
-            return;
-          }
-          const Index cgid = g.gidAt(lx, ly, lz);
-          Index best = cgid;
-          float bv = sdfE(ci);
-          for (int dz = -1; dz <= 1; ++dz)
-            for (int dy = -1; dy <= 1; ++dy)
-              for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0 && dz == 0)
-                  continue;
-                const float nv = sdfE(g.lidx(lx + dx, ly + dy, lz + dz));
-                const Index ngid = g.gidAt(lx + dx, ly + dy, lz + dz);
-                if (nv > bv) {
-                  bv = nv;
-                  best = ngid;
-                } else if (nv == bv && ngid > best)
-                  best = ngid;
-              }
-          labWork(ci) = (best == cgid) ? Index(-1) : best;  // solid max: label 0 (excluded)
-        });
-    space.fence();
-    int rounds = 0;
-    for (;;) {
-      haloI.exchange(labWork);
-      int pending = 0;
-      Kokkos::parallel_reduce(
-          "pnm::nfmpi::basin_resolve", R1(space, 0, nInner),
-          KOKKOS_LAMBDA(std::size_t o, int& pend) {
-            const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
-                      iz = int(o / (Index(g.nx) * g.ny));
-            const Index ci = g.lidx(ix + 1, iy + 1, iz + 1);
-            Index t = labWork(ci);
-            if (t < 0)
-              return;  // finalized
-            for (int s0 = 0; s0 < 64; ++s0) {
-              const Index tl = g.localOf(t);
-              if (tl < 0)
-                break;
-              const Index tv = labWork(tl);
-              if (tv < 0) {  // that cell knows its basin label: adopt, finalized
-                t = tv;
-                break;
-              }
-              const Index nl = g.localOf(tv);
-              if (nl < 0)
-                break;  // next hop leaves the block: hold, wait for its owner
-              t = tv;
-            }
-            if (t != labWork(ci))
-              labWork(ci) = t;
-            if (t >= 0)
-              pend += 1;
-          },
-          pending);
-      space.fence();
-      int globalPending = 0;
-      MPI_Allreduce(&pending, &globalPending, 1, MPI_INT, MPI_SUM, comm);
-      if (!globalPending)
-        break;
-      if (++rounds > 100000) {
-        // collective: the round count and the Allreduce'd stop are identical on every rank
-        throw std::runtime_error("[pnm::mpi] flow-basin resolution did not converge");
-      }
-    }
+    kn::forestInit(
+        space, geo, sdfE, labWork, KOKKOS_LAMBDA(Index ci) { return sdfE(ci) <= 0.0f; },
+        KOKKOS_LAMBDA(Index ci, Index) { return -(Index(segE(ci)) + 1); },  // pore: own label
+        KOKKOS_LAMBDA(Index, Index) { return Index(-1); });  // solid max: label 0 (excluded)
+    dm::resolveToFixpoint(space, geo, haloI, labWork, comm, "flow-basin resolution");
   }
   View<int> flowLab("pnm::nfmpi::flowLab", nExt);
   Kokkos::parallel_for(
@@ -1042,18 +716,7 @@ inline NetworkFlow extract_network_flow_mpi(
   // interpolation cube around a peak can reach 2 cells out, so p gets its own g=2 halo.
   int np = 0;
   {
-    int npLoc = 0;
-    Kokkos::parallel_reduce(
-        "pnm::nfmpi::np", R1(space, 0, nInner),
-        KOKKOS_LAMBDA(std::size_t o, int& m) {
-          const int ix = int(o % g.nx), iy = int((o / g.nx) % g.ny),
-                    iz = int(o / (Index(g.nx) * g.ny));
-          const int sv = segE(g.lidx(ix + 1, iy + 1, iz + 1));
-          if (sv > m)
-            m = sv;
-        },
-        Kokkos::Max<int>(npLoc));
-    space.fence();
+    const int npLoc = kn::maxLabel(space, geo, segE);
     MPI_Allreduce(&npLoc, &np, 1, MPI_INT, MPI_MAX, comm);
   }
   if (np == 0)
@@ -1063,32 +726,8 @@ inline NetworkFlow extract_network_flow_mpi(
   topo2.buildTopology(dec, rank, 2, {true, true, true}, comm);
   GridHalo<double> haloP2;
   haloP2.init(topo2);
-  const auto& idxr2 = topo2.indexer();
-  BlockGeo g2{};
-  g2.ex = (int)idxr2.sizeInclGhost()[0];
-  g2.ey = (int)idxr2.sizeInclGhost()[1];
-  g2.ez = (int)idxr2.sizeInclGhost()[2];
-  g2.ox = (int)idxr2.originInclGhost()[0];
-  g2.oy = (int)idxr2.originInclGhost()[1];
-  g2.oz = (int)idxr2.originInclGhost()[2];
-  g2.nx = geo.nx;
-  g2.ny = geo.ny;
-  g2.nz = geo.nz;
-  g2.gnx = gdims[0];
-  g2.gny = gdims[1];
-  g2.gnz = gdims[2];
-  g2.g = 2;
-  View<double> pE2("pnm::nfmpi::pE2", std::size_t(g2.ex) * g2.ey * g2.ez);
-  {
-    View<double> i0("pnm::nfmpi::pi", nInner);
-    uploadVec(p_h, i0);
-    const BlockGeo gg = g2;
-    Kokkos::parallel_for(
-        "pnm::nfmpi::stageP2", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          pE2(gg.lidx(ix + 2, iy + 2, iz + 2)) = i0((Index(iz) * g.ny + iy) * g.nx + ix);
-        });
-    space.fence();
-  }
+  const BlockGeo g2 = dm::blockGeoOf(topo2, gdims, 2);
+  View<double> pE2 = dm::stageInner(space, g2, p_h, "pnm::nfmpi::pE2");
   haloP2.exchange(pE2);
 
   std::vector<PoreRec> recs;
@@ -1102,82 +741,25 @@ inline NetworkFlow extract_network_flow_mpi(
     Kokkos::parallel_for(
         "pnm::nfmpi::pores", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
           const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-          const Index ci = g.lidx(lx, ly, lz);
+          const Index ci = g.cell(lx, ly, lz);
           const float cv = sdfE(ci);
           if (cv <= 0.0f)
             return;
-          const Index cgid = g.gidAt(lx, ly, lz);
-          bool peak = true;
-          for (int dz = -1; dz <= 1 && peak; ++dz)
-            for (int dy = -1; dy <= 1 && peak; ++dy)
-              for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0 && dz == 0)
-                  continue;
-                const float nv = sdfE(g.lidx(lx + dx, ly + dy, lz + dz));
-                const Index ngid = g.gidAt(lx + dx, ly + dy, lz + dz);
-                if (nv > cv || (nv == cv && ngid > cgid)) {
-                  peak = false;
-                  break;
-                }
-              }
-          if (!peak)
+          if (!kn::isPeak(g, sdfE, lx, ly, lz, cv, g.gid(lx, ly, lz)))
             return;
-          float sw = 0.0f, px = 0.0f, py = 0.0f, pz = 0.0f;
-          for (int dz = -1; dz <= 1; ++dz)
-            for (int dy = -1; dy <= 1; ++dy)
-              for (int dx = -1; dx <= 1; ++dx) {
-                const float v0 = sdfE(g.lidx(lx + dx, ly + dy, lz + dz));
-                float w0 = v0 > 0.0f ? v0 : 0.0f;
-                w0 = w0 * w0;
-                sw += w0;
-                px += dx * w0;
-                py += dy * w0;
-                pz += dz * w0;
-              }
-          float fx = 0, fy = 0, fz = 0;
-          if (sw > 1e-6f) {
-            fx = px / sw;
-            fy = py / sw;
-            fz = pz / sw;
-          }
-          const int gx = BlockGeo::wrapc(g.ox + lx, g.gnx), gy = BlockGeo::wrapc(g.oy + ly, g.gny),
-                    gz = BlockGeo::wrapc(g.oz + lz, g.gnz);
           PoreRec rec;
           rec.id = segE(ci);
-          rec.pgx = gx;
-          rec.pgy = gy;
-          rec.pgz = gz;
-          rec.po = Pore{oxo + (gx + fx) * sx, oyo + (gy + fy) * sy, ozo + (gz + fz) * sz, cv};
+          g.gcoord(lx, ly, lz, rec.pgx, rec.pgy, rec.pgz);
+          rec.po = kn::poreAt(g, sdfE, lx, ly, lz, oxo, oyo, ozo, sx, sy, sz);
           // trilinear p at the refined position: base cells are within peak +- 2 (g2 ring)
           const double gp3[3] = {(rec.po.x - oxo) / sx, (rec.po.y - oyo) / sy,
                                  (rec.po.z - ozo) / sz};
-          int b[3];
-          double f[3];
-          for (int a = 0; a < 3; ++a) {
-            const double fl = Kokkos::floor(gp3[a]);
-            b[a] = int(fl);
-            f[a] = gp3[a] - fl;
-          }
-          double acc = 0.0;
-          for (int dz = 0; dz < 2; ++dz)
-            for (int dy = 0; dy < 2; ++dy)
-              for (int dx = 0; dx < 2; ++dx) {
-                const double wt =
-                    (dx ? f[0] : 1.0 - f[0]) * (dy ? f[1] : 1.0 - f[1]) * (dz ? f[2] : 1.0 - f[2]);
-                const Index e2 = gg.localOf((Index(BlockGeo::wrapc(b[2] + dz, gg.gnz)) * gg.gny +
-                                             BlockGeo::wrapc(b[1] + dy, gg.gny)) *
-                                                gg.gnx +
-                                            BlockGeo::wrapc(b[0] + dx, gg.gnx));
-                acc += wt * pE2(e2);
-              }
-          rec.press = acc;
+          rec.press = kn::trilinear(gg, pE2, gp3);
           const int s0 = Kokkos::atomic_fetch_add(&cnt(), 1);
           buf(s0) = rec;
         });
     space.fence();
-    auto hc = Kokkos::create_mirror_view(cnt);
-    Kokkos::deep_copy(hc, cnt);
-    recs = downloadN(buf, std::size_t(hc()));
+    recs = downloadN(buf, std::size_t(readScalar(cnt)));
   }
   auto allRecs = dm::allgatherv(recs, comm);
   out.pores.resize(np);
@@ -1203,427 +785,76 @@ inline NetworkFlow extract_network_flow_mpi(
   // single-rank order exactly.
   const std::size_t nfL = 3 * nInner;
   Kokkos::View<Index*, Mem> faceLab("pnm::nfmpi::faceLab", nfL);  // final: patch label (min fid)
-  View<Index> flabE[3], fpairE[3];  // per-direction extended fields for the boundary merge
-  std::vector<Index> keySorted_;    // patch roots sorted (device lookup keys)
-  std::vector<int> slotOf_;         // key position -> throat slot
-  constexpr Index kSent = 0x7ffffffffffffffeLL;  // film awaiting attachment (see single-rank)
+  kn::ThroatSlots slots;
+  constexpr Index kSent = kn::kSent;  // film awaiting attachment
   {
-    const bool ho = hasOpen;
     Kokkos::View<int*, Mem> parent("pnm::nfmpi::fparent", nfL);
     Kokkos::View<Index*, Mem> fpairL("pnm::nfmpi::fpairL", nfL);
     Kokkos::View<char*, Mem> fcoreL("pnm::nfmpi::fcoreL", nfL);
-    // interface predicate + CORE tier (both cells fluid-centered — see single-rank rationale)
-    Kokkos::parallel_for(
-        "pnm::nfmpi::face_init", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-          const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-          const Index ce = g.lidx(lx, ly, lz);
-          const int a = flowLab(ce);
-          for (int d = 0; d < 3; ++d) {
-            const Index nb = g.lidx(lx + (d == 0), ly + (d == 1), lz + (d == 2));
-            const int b = flowLab(nb);
-            const double opn = ho ? (d == 0 ? oxE(nb) : (d == 1 ? oyE(nb) : ozE(nb))) : 1.0;
-            const bool itf = (a != b && a > 0 && b > 0 && opn > 0.0);
-            fcoreL(3 * o + d) = (itf && sdfE(ce) > 0.0f && sdfE(nb) > 0.0f) ? 1 : 0;
-            parent(3 * o + d) = fcoreL(3 * o + d) ? int(3 * o + d) : -1;
-            fpairL(3 * o + d) = itf ? ((Index(a < b ? a : b) << 32) | (a < b ? b : a)) : Index(-1);
-          }
-        });
-    space.fence();
-    // local CCL to fixpoint (owned-owned adjacency only; cross-block via the boundary graph)
     Kokkos::View<int, Mem> changed("pnm::nfmpi::fch");
-    int h_changed = 1;
-    while (h_changed) {
-      Kokkos::deep_copy(changed, 0);
-      Kokkos::parallel_for(
-          "pnm::nfmpi::face_merge", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-            for (int d = 0; d < 3; ++d) {
-              const int f = int(3 * o + d);
-              if (parent(f) < 0)
-                continue;
-              const Index pk = fpairL(f);
-              for (int dz = -1; dz <= 1; ++dz)
-                for (int dy = -1; dy <= 1; ++dy)
-                  for (int dx = -1; dx <= 1; ++dx) {
-                    const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                    if (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 || jz >= g.nz)
-                      continue;  // ghost-side faces go through the boundary graph
-                    const Index o2 = (Index(jz) * g.ny + jy) * g.nx + jx;
-                    for (int d2 = 0; d2 < 3; ++d2) {
-                      const int f2 = int(3 * o2 + d2);
-                      if (f2 == f || parent(f2) < 0 || fpairL(f2) != pk)
-                        continue;
-                      const int Dx = 2 * dx + (d2 == 0) - (d == 0);
-                      const int Dy = 2 * dy + (d2 == 1) - (d == 1);
-                      const int Dz = 2 * dz + (d2 == 2) - (d == 2);
-                      if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
-                        continue;
-                      int rm = f;
-                      while (rm != parent(rm))
-                        rm = parent(rm);
-                      int rn = f2;
-                      while (rn != parent(rn))
-                        rn = parent(rn);
-                      if (rm != rn) {
-                        const int sml = rm < rn ? rm : rn, lrg = rm < rn ? rn : rm;
-                        Kokkos::atomic_min(&parent(lrg), sml);
-                        changed() = 1;
-                      }
-                    }
-                  }
-            }
-          });
-      space.fence();
-      Kokkos::parallel_for(
-          "pnm::nfmpi::face_flatten", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
-            int l = parent(f);
-            if (l >= 0) {
-              while (l != parent(l))
-                l = parent(l);
-              parent(f) = int(l);
-            }
-          });
-      space.fence();
-      auto hc = Kokkos::create_mirror_view(changed);
-      Kokkos::deep_copy(hc, changed);
-      h_changed = hc();
-    }
-    // per-component min GLOBAL fid -> the patch label of the local piece
-    Kokkos::View<Index*, Mem> mg("pnm::nfmpi::fmg", nfL);
-    Kokkos::deep_copy(mg, Index(0x7fffffffffffffffLL));
-    Kokkos::parallel_for(
-        "pnm::nfmpi::face_mingid", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-          const Index gid = g.gidAt(ix + 1, iy + 1, iz + 1);
-          for (int d = 0; d < 3; ++d)
-            if (parent(3 * o + d) >= 0)
-              Kokkos::atomic_min(&mg(parent(3 * o + d)), 3 * gid + d);
-        });
-    space.fence();
-    Kokkos::parallel_for(
-        "pnm::nfmpi::face_label", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
-          faceLab(f) = parent(f) >= 0 ? mg(parent(f)) : (fpairL(f) >= 0 ? kSent : Index(-1));
-        });
-    space.fence();
-    // scatter CORE labels (+ pair keys, once) into per-direction extended fields and exchange
-    auto scatterLabels = [&]() {
-      for (int d = 0; d < 3; ++d) {
-        auto fl = flabE[d];
-        const int dd0 = d;
-        Kokkos::parallel_for(
-            "pnm::nfmpi::face_scatter", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-              const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-              const Index lbl = faceLab(3 * o + dd0);
-              fl(g.lidx(ix + 1, iy + 1, iz + 1)) = (lbl >= 0 && lbl < kSent) ? lbl : Index(-1);
-            });
-        space.fence();
-        haloI.exchange(flabE[d]);
-      }
+    Kokkos::View<Index*, Mem> mg("pnm::nfmpi::fmg", nfL);  // component root -> min global fid
+    auto rootOf = KOKKOS_LAMBDA(int p) {
+      return mg(p);
     };
+    // per-direction extended fields of the face labels / pair keys: exchanged so a boundary face
+    // can see its ghost-side neighbours (the marker CCL exchanges one cell field; a face field is
+    // three of them)
+    View<Index> flabE[3], fpairE[3];
     for (int d = 0; d < 3; ++d) {
       flabE[d] = View<Index>("pnm::nfmpi::flabE", nExt);
       fpairE[d] = View<Index>("pnm::nfmpi::fpairE", nExt);
       Kokkos::deep_copy(flabE[d], Index(-1));
       Kokkos::deep_copy(fpairE[d], Index(-1));
-      auto fq = fpairE[d];
-      const int dd0 = d;
-      Kokkos::parallel_for(
-          "pnm::nfmpi::pair_scatter", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-            fq(g.lidx(ix + 1, iy + 1, iz + 1)) = fpairL(3 * o + dd0);
-          });
-      space.fence();
-      haloI.exchange(fpairE[d]);
     }
-    scatterLabels();
-    // cross-block adjacency pairs (owned face vs ghost-cell face), allgathered + host union-find
-    const std::int64_t maxbp = std::int64_t(nInner) * 8 + 1024;
-    Kokkos::View<Index*, Mem> bpairs("pnm::nfmpi::fbp", std::size_t(2 * maxbp));
-    Kokkos::View<int, Mem> bcnt("pnm::nfmpi::fbpcnt");
-    Kokkos::deep_copy(bcnt, 0);
-    auto fl0 = flabE[0];
-    auto fl1 = flabE[1];
-    auto fl2 = flabE[2];
-    auto fq0 = fpairE[0];
-    auto fq1 = fpairE[1];
-    auto fq2 = fpairE[2];
-    Kokkos::parallel_for(
-        "pnm::nfmpi::face_bpairs", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          if (ix > 0 && ix < g.nx - 1 && iy > 0 && iy < g.ny - 1 && iz > 0 && iz < g.nz - 1)
-            return;  // only faces within one cell of a block face can touch a ghost face
-          const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-          for (int d = 0; d < 3; ++d) {
-            const Index myl = faceLab(3 * o + d);
-            if (myl < 0 || myl >= kSent)
-              continue;  // core faces only in this merge tier
-            const Index pk = fpairL(3 * o + d);
-            for (int dz = -1; dz <= 1; ++dz)
-              for (int dy = -1; dy <= 1; ++dy)
-                for (int dx = -1; dx <= 1; ++dx) {
-                  const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                  const bool ghost =
-                      (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 || jz >= g.nz);
-                  if (!ghost)
-                    continue;
-                  const Index e2 = g.lidx(jx + 1, jy + 1, jz + 1);
-                  for (int d2 = 0; d2 < 3; ++d2) {
-                    const Index ol = d2 == 0 ? fl0(e2) : (d2 == 1 ? fl1(e2) : fl2(e2));
-                    if (ol < 0 || ol == myl)
-                      continue;
-                    const Index oq = d2 == 0 ? fq0(e2) : (d2 == 1 ? fq1(e2) : fq2(e2));
-                    if (oq != pk)
-                      continue;
-                    const int Dx = 2 * dx + (d2 == 0) - (d == 0);
-                    const int Dy = 2 * dy + (d2 == 1) - (d == 1);
-                    const int Dz = 2 * dz + (d2 == 2) - (d == 2);
-                    if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
-                      continue;
-                    const int s0 = Kokkos::atomic_fetch_add(&bcnt(), 1);
-                    if (s0 < maxbp) {
-                      bpairs(2 * s0) = myl < ol ? myl : ol;
-                      bpairs(2 * s0 + 1) = myl < ol ? ol : myl;
-                    }
-                  }
-                }
-          }
-        });
-    space.fence();
-    auto hcb = Kokkos::create_mirror_view(bcnt);
-    Kokkos::deep_copy(hcb, bcnt);
-    auto flat = downloadN(bpairs, std::size_t(2 * std::min<std::int64_t>(hcb(), maxbp)));
-    std::vector<std::pair<Index, Index>> loc(flat.size() / 2);
-    for (std::size_t i = 0; i < loc.size(); ++i)
-      loc[i] = {flat[2 * i], flat[2 * i + 1]};
-    std::sort(loc.begin(), loc.end());
-    loc.erase(std::unique(loc.begin(), loc.end()), loc.end());
-    auto all = dm::allgatherv(loc, comm);
-    std::map<Index, Index> par;
-    auto find = [&par](Index x) {
-      while (true) {
-        auto it = par.find(x);
-        if (it == par.end() || it->second == x)
-          return x;
-        x = it->second;
-      }
-    };
-    for (const auto& pr : all) {
-      const Index ra = find(pr.first), rb = find(pr.second);
-      if (ra == rb)
-        continue;
-      const Index lo = ra < rb ? ra : rb, hi = ra < rb ? rb : ra;
-      par[hi] = lo;
-      par.emplace(lo, lo);
-    }
-    std::vector<Index> rk, rv;
-    for (const auto& kv : par) {
-      const Index root = find(kv.first);
-      if (root != kv.first) {
-        rk.push_back(kv.first);
-        rv.push_back(root);
-      }
-    }
-    if (!rk.empty()) {
-      View<Index> dk("pnm::nfmpi::frk", rk.size()), dv("pnm::nfmpi::frv", rv.size());
-      uploadVec(rk, dk);
-      uploadVec(rv, dv);
-      const Index nk = Index(rk.size());
-      Kokkos::parallel_for(
-          "pnm::nfmpi::face_remap", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
-            const Index l = faceLab(f);
-            if (l < 0 || l >= kSent)
-              return;
-            const Index k = dm::bsearchKey(dk, nk, l);
-            if (k >= 0)
-              faceLab(f) = dv(k);
-          });
-      space.fence();
-    }
-    // film attachment: min reachable core-patch label, propagated through films across ranks
-    // (scatter+exchange the current labels each sweep; Jacobi min => deterministic fixpoint)
-    {
-      auto fl0 = flabE[0];
-      auto fl1 = flabE[1];
-      auto fl2 = flabE[2];
-      Kokkos::View<int, Mem> changed("pnm::nfmpi::attch");
-      int rounds2 = 0;
-      for (;;) {
-        scatterLabels();
-        Kokkos::deep_copy(changed, 0);
-        Kokkos::parallel_for(
-            "pnm::nfmpi::film_attach", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-              const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-              for (int d = 0; d < 3; ++d) {
-                const Index f = 3 * o + d;
-                if (fcoreL(f) || faceLab(f) < 0)
-                  continue;
-                if (fpairL(f) < 0)
-                  continue;
-                Index best = faceLab(f);
-                const Index pk = fpairL(f);
-                for (int dz = -1; dz <= 1; ++dz)
-                  for (int dy = -1; dy <= 1; ++dy)
-                    for (int dx = -1; dx <= 1; ++dx) {
-                      const Index e2 = g.lidx(ix + 1 + dx, iy + 1 + dy, iz + 1 + dz);
-                      for (int d2 = 0; d2 < 3; ++d2) {
-                        const Index l2 = d2 == 0 ? fl0(e2) : (d2 == 1 ? fl1(e2) : fl2(e2));
-                        if (l2 < 0 || l2 >= best)
-                          continue;
-                        const Index q2 = d2 == 0 ? fq0(e2) : (d2 == 1 ? fq1(e2) : fq2(e2));
-                        if (q2 != pk)
-                          continue;
-                        const int Dx = 2 * dx + (d2 == 0) - (d == 0);
-                        const int Dy = 2 * dy + (d2 == 1) - (d == 1);
-                        const int Dz = 2 * dz + (d2 == 2) - (d == 2);
-                        if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
-                          continue;
-                        best = l2;
-                      }
-                    }
-                if (best < faceLab(f)) {
-                  faceLab(f) = best;
-                  changed() = 1;
-                }
-              }
-            });
-        space.fence();
-        auto hc2 = Kokkos::create_mirror_view(changed);
-        Kokkos::deep_copy(hc2, changed);
-        if (!dm::allreduceMaxInt(hc2(), comm))
-          break;
-        if (++rounds2 > 100000) {
-          // collective: the round count and the Allreduce'd stop are identical on every rank
-          throw std::runtime_error("[pnm::mpi] film attachment did not converge");
-        }
-      }
-    }
-    // leftover films (no core patch reachable anywhere): own patches — local CCL + one boundary
-    // merge, exactly like the core tier but restricted to still-kSent faces
-    {
-      Kokkos::parallel_for(
-          "pnm::nfmpi::leftover_init", R1(space, 0, nfL),
-          KOKKOS_LAMBDA(std::size_t f) { parent(f) = (faceLab(f) == kSent) ? int(f) : -1; });
-      space.fence();
-      int h_changed2 = 1;
-      while (h_changed2) {
-        Kokkos::deep_copy(changed, 0);
-        Kokkos::parallel_for(
-            "pnm::nfmpi::lo_merge", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-              const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-              for (int d = 0; d < 3; ++d) {
-                const int f = int(3 * o + d);
-                if (parent(f) < 0)
-                  continue;
-                const Index pk = fpairL(f);
-                for (int dz = -1; dz <= 1; ++dz)
-                  for (int dy = -1; dy <= 1; ++dy)
-                    for (int dx = -1; dx <= 1; ++dx) {
-                      const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                      if (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 || jz >= g.nz)
-                        continue;
-                      const Index o2 = (Index(jz) * g.ny + jy) * g.nx + jx;
-                      for (int d2 = 0; d2 < 3; ++d2) {
-                        const int f2 = int(3 * o2 + d2);
-                        if (f2 == f || parent(f2) < 0 || fpairL(f2) != pk)
-                          continue;
-                        const int Dx = 2 * dx + (d2 == 0) - (d == 0);
-                        const int Dy = 2 * dy + (d2 == 1) - (d == 1);
-                        const int Dz = 2 * dz + (d2 == 2) - (d == 2);
-                        if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
-                          continue;
-                        int rm = f;
-                        while (rm != parent(rm))
-                          rm = parent(rm);
-                        int rn = f2;
-                        while (rn != parent(rn))
-                          rn = parent(rn);
-                        if (rm != rn) {
-                          const int sml = rm < rn ? rm : rn, lrg = rm < rn ? rn : rm;
-                          Kokkos::atomic_min(&parent(lrg), sml);
-                          changed() = 1;
-                        }
-                      }
-                    }
-              }
-            });
-        space.fence();
-        Kokkos::parallel_for(
-            "pnm::nfmpi::lo_flatten", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
-              int l = parent(f);
-              if (l >= 0) {
-                while (l != parent(l))
-                  l = parent(l);
-                parent(f) = int(l);
-              }
-            });
-        space.fence();
-        auto hc2 = Kokkos::create_mirror_view(changed);
-        Kokkos::deep_copy(hc2, changed);
-        h_changed2 = hc2();
-      }
-      Kokkos::deep_copy(mg, Index(0x7fffffffffffffffLL));
-      Kokkos::parallel_for(
-          "pnm::nfmpi::lo_mingid", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-            const Index gid = g.gidAt(ix + 1, iy + 1, iz + 1);
-            for (int d = 0; d < 3; ++d)
-              if (parent(3 * o + d) >= 0)
-                Kokkos::atomic_min(&mg(parent(3 * o + d)), 3 * gid + d);
-          });
-      space.fence();
-      Kokkos::parallel_for(
-          "pnm::nfmpi::lo_label", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
-            if (faceLab(f) == kSent)
-              faceLab(f) = mg(parent(f));
-          });
-      space.fence();
-      // boundary merge of leftover patches: scatter leftover labels only, exchange, pair, merge
+    const kn::SplitFaces<View<Index>> nbLab{flabE[0], flabE[1], flabE[2]};
+    const kn::SplitFaces<View<Index>> nbPair{fpairE[0], fpairE[1], fpairE[2]};
+    // scatter the owned face labels of direction d (all attached labels, or only the faces
+    // parent >= 0 — the tier currently being merged) and exchange
+    auto scatterLabels = [&](bool byParent) {
       for (int d = 0; d < 3; ++d) {
         auto fl = flabE[d];
         const int dd0 = d;
         Kokkos::parallel_for(
-            "pnm::nfmpi::lo_scatter", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-              const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-              fl(g.lidx(ix + 1, iy + 1, iz + 1)) =
-                  (parent(3 * o + dd0) >= 0) ? faceLab(3 * o + dd0) : Index(-1);
+            "pnm::nfmpi::face_scatter", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+              const Index f = 3 * g.owned(ix, iy, iz) + dd0;
+              const Index lbl = faceLab(f);
+              const bool take = byParent ? (parent(f) >= 0) : (lbl >= 0 && lbl < kSent);
+              fl(g.cell(ix + 1, iy + 1, iz + 1)) = take ? lbl : Index(-1);
             });
         space.fence();
         haloI.exchange(flabE[d]);
       }
-      auto fl0b = flabE[0];
-      auto fl1b = flabE[1];
-      auto fl2b = flabE[2];
+    };
+    // cross-block adjacency pairs (owned face with parent >= 0 vs ghost-cell face of the same
+    // pair), then ONE global merge applied to the owned labels of that tier
+    const std::int64_t maxbp = std::int64_t(nInner) * 8 + 1024;
+    Kokkos::View<Index*, Mem> bpairs("pnm::nfmpi::fbp", std::size_t(2 * maxbp));
+    Kokkos::View<int, Mem> bcnt("pnm::nfmpi::fbpcnt");
+    auto boundaryMerge = [&]() {
       Kokkos::deep_copy(bcnt, 0);
       Kokkos::parallel_for(
-          "pnm::nfmpi::lo_bpairs", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-            if (ix > 0 && ix < g.nx - 1 && iy > 0 && iy < g.ny - 1 && iz > 0 && iz < g.nz - 1)
-              return;
-            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
+          "pnm::nfmpi::face_bpairs", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+            if (!g.onSurface(ix, iy, iz))
+              return;  // only faces within one cell of a block face can touch a ghost face
+            const Index o = g.owned(ix, iy, iz);
             for (int d = 0; d < 3; ++d) {
               if (parent(3 * o + d) < 0)
-                continue;
+                continue;  // this tier's faces only
               const Index myl = faceLab(3 * o + d);
               const Index pk = fpairL(3 * o + d);
               for (int dz = -1; dz <= 1; ++dz)
                 for (int dy = -1; dy <= 1; ++dy)
                   for (int dx = -1; dx <= 1; ++dx) {
-                    const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                    const bool ghost =
-                        (jx < 0 || jx >= g.nx || jy < 0 || jy >= g.ny || jz < 0 || jz >= g.nz);
-                    if (!ghost)
+                    if (g.inOwned(ix + dx, iy + dy, iz + dz))
                       continue;
-                    const Index e2 = g.lidx(jx + 1, jy + 1, jz + 1);
+                    const Index e2 = g.cell(ix + 1 + dx, iy + 1 + dy, iz + 1 + dz);
                     for (int d2 = 0; d2 < 3; ++d2) {
-                      const Index ol = d2 == 0 ? fl0b(e2) : (d2 == 1 ? fl1b(e2) : fl2b(e2));
+                      const Index ol = nbLab(e2, d2);
                       if (ol < 0 || ol == myl)
                         continue;
-                      const Index oq = d2 == 0 ? fq0(e2) : (d2 == 1 ? fq1(e2) : fq2(e2));
-                      if (oq != pk)
+                      if (nbPair(e2, d2) != pk)
                         continue;
-                      const int Dx = 2 * dx + (d2 == 0) - (d == 0);
-                      const int Dy = 2 * dy + (d2 == 1) - (d == 1);
-                      const int Dz = 2 * dz + (d2 == 2) - (d == 2);
-                      if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
+                      if (!kn::facesAdjacent(dx, dy, dz, d, d2))
                         continue;
                       const int s0 = Kokkos::atomic_fetch_add(&bcnt(), 1);
                       if (s0 < maxbp) {
@@ -1635,56 +866,60 @@ inline NetworkFlow extract_network_flow_mpi(
             }
           });
       space.fence();
-      auto hcb2 = Kokkos::create_mirror_view(bcnt);
-      Kokkos::deep_copy(hcb2, bcnt);
-      auto flat2 = downloadN(bpairs, std::size_t(2 * std::min<std::int64_t>(hcb2(), maxbp)));
-      std::vector<std::pair<Index, Index>> loc2(flat2.size() / 2);
-      for (std::size_t i = 0; i < loc2.size(); ++i)
-        loc2[i] = {flat2[2 * i], flat2[2 * i + 1]};
-      std::sort(loc2.begin(), loc2.end());
-      loc2.erase(std::unique(loc2.begin(), loc2.end()), loc2.end());
-      auto all2 = dm::allgatherv(loc2, comm);
-      std::map<Index, Index> par2;
-      auto find2 = [&par2](Index x) {
-        while (true) {
-          auto it = par2.find(x);
-          if (it == par2.end() || it->second == x)
-            return x;
-          x = it->second;
+      const auto loc =
+          dm::localPairs(bpairs, std::size_t(std::min<std::int64_t>(readScalar(bcnt), maxbp)));
+      const dm::MergeRemap merge = dm::globalMerge(loc, comm);
+      dm::applyRemap(
+          space, merge, faceLab, nfL, KOKKOS_LAMBDA(std::size_t f) { return parent(f) >= 0; });
+    };
+    // one local CCL tier: fixpoint over the faces with parent >= 0, then their min global fid
+    auto cclTier = [&]() {
+      kn::cclFixpoint(space, parent, nfL, changed,
+                      [&]() { kn::faceMerge(space, geo, parent, fpairL, changed); });
+      Kokkos::deep_copy(mg, Index(0x7fffffffffffffffLL));
+      kn::faceMinGid(space, geo, parent, mg);
+    };
+
+    // interface predicate + CORE tier (both cells fluid-centered — see single-rank rationale)
+    kn::faceInit(space, geo, flowLab, sdfE, oxE, oyE, ozE, hasOpen, fcoreL, parent, fpairL);
+    cclTier();
+    kn::faceLabelCore(space, nfL, parent, fpairL, faceLab, rootOf);
+    // pair keys onto the extended fields (once) + the core labels, exchange, boundary merge
+    for (int d = 0; d < 3; ++d) {
+      auto fq = fpairE[d];
+      const int dd0 = d;
+      Kokkos::parallel_for(
+          "pnm::nfmpi::pair_scatter", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
+            fq(g.cell(ix + 1, iy + 1, iz + 1)) = fpairL(3 * g.owned(ix, iy, iz) + dd0);
+          });
+      space.fence();
+      haloI.exchange(fpairE[d]);
+    }
+    scatterLabels(false);
+    boundaryMerge();
+    // film attachment: min reachable core-patch label, propagated through films across ranks
+    // (scatter+exchange the current labels each sweep; Jacobi min => deterministic fixpoint)
+    {
+      int rounds2 = 0;
+      for (;;) {
+        scatterLabels(false);
+        Kokkos::deep_copy(changed, 0);
+        kn::filmAttachSweep(space, geo, faceLab, fpairL, fcoreL, nbLab, nbPair, changed);
+        if (!dm::allreduceMaxInt(readScalar(changed), comm))
+          break;
+        if (++rounds2 > 100000) {
+          // collective: the round count and the Allreduce'd stop are identical on every rank
+          throw std::runtime_error("[pnm::mpi] film attachment did not converge");
         }
-      };
-      for (const auto& pr : all2) {
-        const Index ra = find2(pr.first), rb = find2(pr.second);
-        if (ra == rb)
-          continue;
-        const Index lo = ra < rb ? ra : rb, hi = ra < rb ? rb : ra;
-        par2[hi] = lo;
-        par2.emplace(lo, lo);
-      }
-      std::vector<Index> rk2, rv2;
-      for (const auto& kv : par2) {
-        const Index root = find2(kv.first);
-        if (root != kv.first) {
-          rk2.push_back(kv.first);
-          rv2.push_back(root);
-        }
-      }
-      if (!rk2.empty()) {
-        View<Index> dk2("pnm::nfmpi::frk2", rk2.size()), dv2("pnm::nfmpi::frv2", rv2.size());
-        uploadVec(rk2, dk2);
-        uploadVec(rv2, dv2);
-        const Index nk2 = Index(rk2.size());
-        Kokkos::parallel_for(
-            "pnm::nfmpi::lo_remap", R1(space, 0, nfL), KOKKOS_LAMBDA(std::size_t f) {
-              if (parent(f) < 0)
-                return;
-              const Index k = dm::bsearchKey(dk2, nk2, faceLab(f));
-              if (k >= 0)
-                faceLab(f) = dv2(k);
-            });
-        space.fence();
       }
     }
+    // leftover films (no core patch reachable anywhere): own patches — local CCL + one boundary
+    // merge, exactly like the core tier but restricted to still-kSent faces
+    kn::leftoverInit(space, nfL, faceLab, parent);
+    cclTier();
+    kn::faceLabelLeftover(space, nfL, parent, faceLab, rootOf);
+    scatterLabels(true);
+    boundaryMerge();
     // global unique (patch root, pair) -> throat list, ordered by (pair, root fid)
     {
       auto flabH = downloadN(faceLab, nfL);
@@ -1693,37 +928,18 @@ inline NetworkFlow extract_network_flow_mpi(
       for (std::size_t f = 0; f < nfL; ++f)
         if (flabH[f] >= 0)
           locR.push_back({flabH[f], fpairH[f]});
-      std::sort(locR.begin(), locR.end());
-      locR.erase(std::unique(locR.begin(), locR.end()), locR.end());
+      dm::sortUnique(locR);
       auto allR = dm::allgatherv(locR, comm);
-      std::sort(allR.begin(), allR.end());
-      allR.erase(std::unique(allR.begin(), allR.end()), allR.end());
-      std::sort(allR.begin(), allR.end(),
-                [](const std::pair<Index, Index>& x, const std::pair<Index, Index>& y) {
-                  return x.second != y.second ? x.second < y.second : x.first < y.first;
-                });
-      for (const auto& rp : allR)
-        out.throats.push_back({int(rp.second >> 32), int(rp.second & 0x7fffffff)});
-      // (root fid -> slot) sorted by root for the device lookup
-      std::vector<Index> rootF;
-      for (const auto& rp : allR)
-        rootF.push_back(rp.first);
-      std::vector<Index> rootSorted = rootF;
-      std::sort(rootSorted.begin(), rootSorted.end());
-      std::vector<int> slotOf(rootF.size());
-      for (std::size_t t = 0; t < rootF.size(); ++t) {
-        const auto it = std::lower_bound(rootSorted.begin(), rootSorted.end(), rootF[t]);
-        slotOf[std::size_t(it - rootSorted.begin())] = int(t);
-      }
-      keySorted_ = std::move(rootSorted);
-      slotOf_ = std::move(slotOf);
+      dm::sortUnique(allR);
+      slots = kn::throatSlots(std::move(allR));
     }
   }
+  out.throats = slots.throats;
   const std::size_t nt = out.throats.size();
   Kokkos::View<Index*, Mem> keyD("pnm::nfmpi::keys", nt);
   Kokkos::View<int*, Mem> slotD("pnm::nfmpi::slots", nt);
-  uploadVec(keySorted_, keyD);
-  uploadVec(slotOf_, slotD);
+  uploadVec(slots.keySorted, keyD);
+  uploadVec(slots.slotOf, slotD);
 
   // 6. rank-local accumulation over owned +faces, then a global sum-reduce
   std::vector<double> Qh(nt, 0.0), Ah(nt, 0.0), Cxh(nt, 0.0), Cyh(nt, 0.0), Czh(nt, 0.0),
@@ -1731,71 +947,8 @@ inline NetworkFlow extract_network_flow_mpi(
   {
     View<double> Q("pnm::nfmpi::Q", nt), A("pnm::nfmpi::A", nt), Cx("pnm::nfmpi::Cx", nt),
         Cy("pnm::nfmpi::Cy", nt), Cz("pnm::nfmpi::Cz", nt), resid("pnm::nfmpi::res", np);
-    const double Axf = double(spacing[1]) * spacing[2], Ayf = double(spacing[0]) * spacing[2],
-                 Azf = double(spacing[0]) * spacing[1];
-    const std::int64_t ntl = std::int64_t(nt);
-    const bool ho = hasOpen;
-    const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
-    const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
-    const double Lx = double(g.gnx) * sx, Ly = double(g.gny) * sy, Lz = double(g.gnz) * sz;
-    Kokkos::parallel_for(
-        "pnm::nfmpi::throat_flux", inner, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const int lx = ix + 1, ly = iy + 1, lz = iz + 1;
-          const int a = flowLab(g.lidx(lx, ly, lz));
-          for (int d = 0; d < 3; ++d) {
-            const Index nb = g.lidx(lx + (d == 0), ly + (d == 1), lz + (d == 2));
-            const int b = flowLab(nb);
-            if (a == b)
-              continue;
-            const double vel = d == 0 ? uE(nb) : (d == 1 ? vE(nb) : wE(nb));
-            const double opn = ho ? (d == 0 ? oxE(nb) : (d == 1 ? oyE(nb) : ozE(nb))) : 1.0;
-            const double area = d == 0 ? Axf : (d == 1 ? Ayf : Azf);
-            const double q = opn * vel * area;
-            if (a > 0)
-              Kokkos::atomic_add(&resid(a - 1), q);
-            if (b > 0)
-              Kokkos::atomic_add(&resid(b - 1), -q);
-            const Index o = (Index(iz) * g.ny + iy) * g.nx + ix;
-            const Index rt = faceLab(3 * o + d);  // patch root, -1 = no throat face
-            if (rt >= 0) {
-              std::int64_t l = 0, hgh = ntl - 1, slot = -1;
-              while (l <= hgh) {
-                const std::int64_t mid = l + (hgh - l) / 2;
-                if (keyD(mid) == rt) {
-                  slot = slotD(mid);
-                  break;
-                }
-                if (keyD(mid) < rt)
-                  l = mid + 1;
-                else
-                  hgh = mid - 1;
-              }
-              const int lo = a < b ? a : b;
-              if (slot >= 0) {
-                const double w0 = opn * area;
-                Kokkos::atomic_add(&Q(slot), a < b ? q : -q);
-                Kokkos::atomic_add(&A(slot), w0);
-                const int gx = BlockGeo::wrapc(g.ox + lx, g.gnx),
-                          gy = BlockGeo::wrapc(g.oy + ly, g.gny),
-                          gz = BlockGeo::wrapc(g.oz + lz, g.gnz);
-                double fp[3] = {oxo + (gx + (d == 0 ? 0.5 : 0.0)) * double(sx),
-                                oyo + (gy + (d == 1 ? 0.5 : 0.0)) * double(sy),
-                                ozo + (gz + (d == 2 ? 0.5 : 0.0)) * double(sz)};
-                const double pc[3] = {ancXD(lo - 1), ancYD(lo - 1), ancZD(lo - 1)};
-                const double Lw[3] = {Lx, Ly, Lz};
-                for (int a2 = 0; a2 < 3; ++a2) {
-                  double dv = fp[a2] - pc[a2];
-                  dv -= Lw[a2] * Kokkos::round(dv / Lw[a2]);
-                  fp[a2] = dv;
-                }
-                Kokkos::atomic_add(&Cx(slot), w0 * fp[0]);
-                Kokkos::atomic_add(&Cy(slot), w0 * fp[1]);
-                Kokkos::atomic_add(&Cz(slot), w0 * fp[2]);
-              }
-            }
-          }
-        });
-    space.fence();
+    kn::throatFlux(space, geo, flowLab, uE, vE, wE, oxE, oyE, ozE, hasOpen, faceLab, keyD, slotD,
+                   nt, ancXD, ancYD, ancZD, origin, spacing, gdims, Q, A, Cx, Cy, Cz, resid);
     auto red = [&](const View<double>& d, std::vector<double>& h) {
       auto loc = downloadN(d, h.size());
       MPI_Allreduce(loc.data(), h.data(), int(h.size()), MPI_DOUBLE, MPI_SUM, comm);
@@ -1812,30 +965,9 @@ inline NetworkFlow extract_network_flow_mpi(
   out.pore_residual = Rh;
 
   // 7. dp: identical on every rank (throat-anchored two-leg min-image, as single-rank)
-  out.throat_dp.resize(nt);
-  const double L[3] = {double(gdims[0]) * spacing[0], double(gdims[1]) * spacing[1],
-                       double(gdims[2]) * spacing[2]};
-  for (std::size_t t = 0; t < nt; ++t) {
-    const int li = out.throats[t].first, lj = out.throats[t].second;
-    const Pore& pi = out.pores[li - 1];
-    const Pore& pj = out.pores[lj - 1];
-    const double aw = out.throat_area[t];
-    const double anc[3] = {ancX[li - 1], ancY[li - 1], ancZ[li - 1]};
-    const double ancj[3] = {ancX[lj - 1], ancY[lj - 1], ancZ[lj - 1]};
-    double macro = 0.0;
-    const double pip[3] = {double(pi.x), double(pi.y), double(pi.z)};
-    const double pjp[3] = {double(pj.x), double(pj.y), double(pj.z)};
-    const int N[3] = {gdims[0], gdims[1], gdims[2]};
-    for (int a = 0; a < 3; ++a) {
-      // identical snapped-integer image decision as the single-rank path (see pore_extraction.hpp)
-      const double ct = (Cxh[t] * (a == 0) + Cyh[t] * (a == 1) + Czh[t] * (a == 2)) / aw;
-      const long long Dc = llround((ancj[a] - anc[a]) / double(spacing[a])) -
-                           llround(ct / double(spacing[a]) + 1e-6);
-      const long long k = llround(double(Dc) / N[a]);
-      macro += grad_p[a] * ((pjp[a] - pip[a]) - L[a] * double(k));
-    }
-    out.throat_dp[t] = (out.pore_pressure[li - 1] - out.pore_pressure[lj - 1]) - macro;
-  }
+  out.throat_dp =
+      kn::throatPressureDrops(out.throats, out.pores, out.pore_pressure, out.throat_area, Cxh, Cyh,
+                              Czh, ancX, ancY, ancZ, spacing, gdims, grad_p);
   return out;
 }
 

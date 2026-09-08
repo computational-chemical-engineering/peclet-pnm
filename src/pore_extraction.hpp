@@ -4,10 +4,11 @@
 /// Pore detection (local maxima of the SDF + weighted centroid), marker-controlled watershed
 /// segmentation of the solid (init markers -> union-find CCL -> flood fill), gradient-path pore
 /// basins, boundary-pair throat topology, and the network-flow extraction from a peclet.flow MAC
-/// field. Device kernels are Kokkos::parallel_for over Kokkos::Views (any backend: CUDA / HIP /
-/// OpenMP / Serial); host orchestration (label renumber, topology sort/unique) stays on the host.
-/// The distributed pipeline (pore_extraction_mpi.hpp) reproduces these stages on the core block
-/// decomposition, bit-exact.
+/// field. The stage kernels live in pore_kernels.hpp (shared with the distributed pipeline,
+/// instantiated here on the trivial `GridGeo` geometry — the field is the whole periodic grid);
+/// this file is the single-rank orchestration: device-resident buffers, the fixpoint loops, the
+/// device renumbering and the host topology sort/unique. The distributed pipeline
+/// (pore_extraction_mpi.hpp) runs the SAME kernels on the core block decomposition, bit-exact.
 #ifndef PECLET_PNM_PORE_EXTRACTION_HPP
 #define PECLET_PNM_PORE_EXTRACTION_HPP
 
@@ -15,53 +16,12 @@
 #include <array>
 #include <cstdint>
 #include <Kokkos_Core.hpp>
-#include <map>
 #include <utility>
 #include <vector>
 
+#include "pore_kernels.hpp"
+
 namespace pnm {
-
-struct Pore {
-  float x, y, z, radius;
-};
-struct I3 {
-  int x, y, z;
-};
-
-using Exec = Kokkos::DefaultExecutionSpace;
-using Mem = Exec::memory_space;
-
-/// Bulk host->device upload of a whole std::vector via one deep_copy over an unmanaged host view —
-/// replaces the per-element `create_mirror_view` + fill loop (F3). `d` must already be sized to
-/// `h`.
-template <class T>
-inline void uploadVec(const std::vector<T>& h, const Kokkos::View<T*, Mem>& d) {
-  if (h.empty())
-    return;
-  Kokkos::deep_copy(
-      d, Kokkos::View<const T*, Kokkos::HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
-             h.data(), h.size()));
-}
-
-/// Download the first `count` elements of a device view into a fresh std::vector via one deep_copy
-/// — replaces the `create_mirror_view` (whole view) + element loop (S2/G1), and only moves what is
-/// used.
-template <class V>
-inline std::vector<typename V::value_type> downloadN(const V& d, std::size_t count) {
-  std::vector<typename V::value_type> out(count);
-  if (count)
-    Kokkos::deep_copy(Kokkos::View<typename V::value_type*, Kokkos::HostSpace,
-                                   Kokkos::MemoryTraits<Kokkos::Unmanaged>>(out.data(), count),
-                      Kokkos::subview(d, Kokkos::make_pair(std::size_t(0), count)));
-  return out;
-}
-
-KOKKOS_INLINE_FUNCTION int get_idx(int x, int y, int z, I3 res) {
-  x = (x % res.x + res.x) % res.x;
-  y = (y % res.y + res.y) % res.y;
-  z = (z % res.z + res.z) % res.z;
-  return z * res.y * res.x + y * res.x + x;
-}
 
 // ---- pore detection (local maxima of the SDF + weight-centroid sub-voxel position) ----
 // Device core: operates on an already-uploaded device SDF, so a fused pipeline uploads the SDF
@@ -70,72 +30,14 @@ inline std::vector<Pore> extractPoresView(const Kokkos::View<float*, Mem>& sdf,
                                           std::array<int, 3> resolution,
                                           std::array<float, 3> origin,
                                           std::array<float, 3> spacing) {
-  const I3 res{resolution[0], resolution[1], resolution[2]};
-  const float ox = origin[0], oy = origin[1], oz = origin[2];
-  const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
-  const std::size_t n = sdf.extent(0);
+  const GridGeo geo = GridGeo::of(I3{resolution[0], resolution[1], resolution[2]});
   const int max_pores = 1000000;
-
   Kokkos::View<Pore*, Mem> pores("pores", max_pores);
   Kokkos::View<int, Mem> counter("counter");
   Kokkos::deep_copy(counter, 0);
-
   Exec space;
-  using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
-  Kokkos::parallel_for(
-      "pnm::extract_pores", MD(space, {0, 0, 0}, {res.x, res.y, res.z}),
-      KOKKOS_LAMBDA(int ix, int iy, int iz) {
-        const int ci = get_idx(ix, iy, iz, res);
-        const float cv = sdf(ci);
-        if (cv <= 0.0f)
-          return;
-        bool peak = true;
-        for (int dz = -1; dz <= 1 && peak; ++dz)
-          for (int dy = -1; dy <= 1 && peak; ++dy)
-            for (int dx = -1; dx <= 1; ++dx) {
-              if (dx == 0 && dy == 0 && dz == 0)
-                continue;
-              const int ni = get_idx(ix + dx, iy + dy, iz + dz, res);
-              const float nv = sdf(ni);
-              if (nv > cv || (nv == cv && ni > ci)) {
-                peak = false;
-                break;
-              }
-            }
-        if (!peak)
-          return;
-        float sw = 0.0f, px = 0.0f, py = 0.0f, pz = 0.0f;
-        for (int dz = -1; dz <= 1; ++dz)
-          for (int dy = -1; dy <= 1; ++dy)
-            for (int dx = -1; dx <= 1; ++dx) {
-              const float v = sdf(get_idx(ix + dx, iy + dy, iz + dz, res));
-              float w = v > 0.0f ? v : 0.0f;
-              w = w * w;
-              sw += w;
-              px += dx * w;
-              py += dy * w;
-              pz += dz * w;
-            }
-        float fx = 0, fy = 0, fz = 0;
-        if (sw > 1e-6f) {
-          fx = px / sw;
-          fy = py / sw;
-          fz = pz / sw;
-        }
-        const int slot = Kokkos::atomic_fetch_add(&counter(), 1);
-        if (slot < max_pores)
-          pores(slot) = Pore{ox + (ix + fx) * sx, oy + (iy + fy) * sy, oz + (iz + fz) * sz, cv};
-      });
-  space.fence();
-
-  int h_count = 0;
-  {
-    auto hc = Kokkos::create_mirror_view(counter);
-    Kokkos::deep_copy(hc, counter);
-    h_count = hc();
-  }
-  if (h_count > max_pores)
-    h_count = max_pores;
+  kernels::detectPores(space, geo, sdf, origin, spacing, pores, counter, max_pores);
+  const int h_count = std::min(readScalar(counter), max_pores);
   return downloadN(pores, static_cast<std::size_t>(h_count));
 }
 
@@ -158,157 +60,35 @@ inline Kokkos::View<int*, Mem> segmentVolumeView(const Kokkos::View<float*, Mem>
                                                  std::array<int, 3> resolution,
                                                  std::array<float, 3> spacing,
                                                  Kokkos::View<int*, Mem>* rootsOut = nullptr) {
-  const I3 res{resolution[0], resolution[1], resolution[2]};
+  const GridGeo geo = GridGeo::of(I3{resolution[0], resolution[1], resolution[2]});
   const std::size_t n = sdf.extent(0);
   const float min_sp = std::min(spacing[0], std::min(spacing[1], spacing[2]));
   const float thr = -1.5f * min_sp;
 
   Kokkos::View<int*, Mem> labels("labels", n), roots("roots", n);
   Kokkos::View<int, Mem> changed("changed");
-
   Exec space;
-  using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
-  const auto full = MD(space, {0, 0, 0}, {res.x, res.y, res.z});
 
   // 1. init markers (deep solid -> own index, else -1)
-  Kokkos::parallel_for(
-      "pnm::init_markers", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-        const int i = get_idx(ix, iy, iz, res);
-        labels(i) = (sdf(i) < thr) ? i : -1;
-      });
-  space.fence();
+  kernels::initMarkers(space, geo, sdf, thr, labels);
 
   // 2. union-find CCL on markers (26-connectivity, 13 forward neighbours) + path compression, to
-  // fixpoint
-  auto flatten = [&]() {
-    Kokkos::parallel_for(
-        "pnm::flatten", Kokkos::RangePolicy<Exec>(space, 0, n), KOKKOS_LAMBDA(std::size_t idx) {
-          int l = labels(idx);
-          if (l != -1) {
-            while (l != labels(l))
-              l = labels(l);
-            labels(idx) = l;
-          }
-        });
-    space.fence();
-  };
-  int h_changed = 1;
-  while (h_changed) {
-    Kokkos::deep_copy(changed, 0);
-    Kokkos::parallel_for(
-        "pnm::merge_markers", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const int idx = get_idx(ix, iy, iz, res);
-          const int my = labels(idx);
-          if (my == -1)
-            return;
-          const int dz_l[13] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0};
-          const int dy_l[13] = {-1, -1, -1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0};
-          const int dx_l[13] = {-1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, 1};
-          for (int k = 0; k < 13; ++k) {
-            const int ni = get_idx(ix + dx_l[k], iy + dy_l[k], iz + dz_l[k], res);
-            const int nl = labels(ni);
-            if (nl != -1 && my != nl) {
-              int rm = my;
-              while (rm != labels(rm))
-                rm = labels(rm);
-              int rn = nl;
-              while (rn != labels(rn))
-                rn = labels(rn);
-              if (rm != rn) {
-                const int small = rm < rn ? rm : rn, large = rm < rn ? rn : rm;
-                Kokkos::atomic_min(&labels(large), small);
-                changed() = 1;
-              }
-            }
-          }
-        });
-    space.fence();
-    flatten();
-    auto hc = Kokkos::create_mirror_view(changed);
-    Kokkos::deep_copy(hc, changed);
-    h_changed = hc();
-  }
+  // fixpoint. Labels are voxel ids, so the fixpoint label of a component is its min voxel id.
+  kernels::cclFixpoint(space, labels, n, changed,
+                       [&]() { kernels::cclMergeMarkers(space, geo, labels, changed); });
 
   // 3. flood-fill the remaining (shallow) solid voxels (26-connectivity, smallest neighbour label),
-  // to fixpoint. Jacobi (double-buffered): each sweep reads only the previous sweep's labels, so
-  // the result is DETERMINISTIC — the old in-place sweep could observe same-sweep writes (a device
-  // race) — and sweep-for-sweep identical to the distributed flood (pore_extraction_mpi.hpp),
-  // which is what makes the multi-rank segmentation bit-exact to this single-rank path.
-  Kokkos::View<int*, Mem> labelsN("labelsN", n);
-  h_changed = 1;
-  while (h_changed) {
-    Kokkos::deep_copy(changed, 0);
-    Kokkos::deep_copy(labelsN, labels);
-    Kokkos::parallel_for(
-        "pnm::flood", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-          const int idx = get_idx(ix, iy, iz, res);
-          if (sdf(idx) >= 0.0f)
-            return;  // pore: ignore
-          if (labels(idx) != -1)
-            return;  // already labelled
-          int best = -1;
-          for (int dz = -1; dz <= 1; ++dz)
-            for (int dy = -1; dy <= 1; ++dy)
-              for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0 && dz == 0)
-                  continue;
-                const int nl = labels(get_idx(ix + dx, iy + dy, iz + dz, res));
-                if (nl != -1 && (best == -1 || nl < best))
-                  best = nl;
-              }
-          if (best != -1) {
-            labelsN(idx) = best;
-            changed() = 1;
-          }
-        });
-    space.fence();
-    std::swap(labels, labelsN);
-    auto hc = Kokkos::create_mirror_view(changed);
-    Kokkos::deep_copy(hc, changed);
-    h_changed = hc();
+  // to fixpoint. Jacobi (double-buffered) — deterministic, and sweep-for-sweep identical to the
+  // distributed flood, which is what makes the multi-rank segmentation bit-exact to this path.
+  {
+    Kokkos::View<int*, Mem> labelsN("labelsN", n);
+    kernels::floodFixpoint(space, geo, sdf, labels, labelsN, changed, [](int c) { return c; });
   }
 
   // 4. gradient-path pore basins (ascent for pores, descent for solids; 26-connectivity, tie-break
   // on index)
-  Kokkos::parallel_for(
-      "pnm::gradient_path", full, KOKKOS_LAMBDA(int ix, int iy, int iz) {
-        const int ci = get_idx(ix, iy, iz, res);
-        const bool ascent = (sdf(ci) > 0.0f);
-        int walker = ci;
-        const int MAX_STEPS = 512;
-        for (int s = 0; s < MAX_STEPS; ++s) {
-          int best = walker;
-          float bv = sdf(walker);
-          const int wx = walker % res.x, wy = (walker / res.x) % res.y,
-                    wz = walker / (res.x * res.y);
-          for (int dz = -1; dz <= 1; ++dz)
-            for (int dy = -1; dy <= 1; ++dy)
-              for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0 && dz == 0)
-                  continue;
-                const int ni = get_idx(wx + dx, wy + dy, wz + dz, res);
-                const float nv = sdf(ni);
-                if (ascent) {
-                  if (nv > bv) {
-                    bv = nv;
-                    best = ni;
-                  } else if (nv == bv && ni > best)
-                    best = ni;
-                } else {
-                  if (nv < bv) {
-                    bv = nv;
-                    best = ni;
-                  } else if (nv == bv && ni > best)
-                    best = ni;
-                }
-              }
-          if (best == walker)
-            break;
-          walker = best;
-        }
-        roots(ci) = walker;
-      });
-  space.fence();
+  kernels::gradientWalk(
+      space, geo, sdf, false, KOKKOS_LAMBDA(Index i, Index walker) { roots(i) = int(walker); });
 
   // 5. combine + renumber ON DEVICE (pores >0 ascending, solids <0 descending, debris 0), matching
   // the host first-encounter relabel exactly (F2). A label's id is its rank in voxel-index order of
@@ -325,7 +105,7 @@ inline Kokkos::View<int*, Mem> segmentVolumeView(const Kokkos::View<float*, Mem>
   Kokkos::deep_copy(minPoreIdx, kBig);
   Kokkos::deep_copy(minSolidIdx, kBig);
   const std::size_t nn = n;
-  using R1 = Kokkos::RangePolicy<Exec>;
+  using R1 = kernels::R1;
   // (a) per-root/label min voxel index of first appearance (pores use `roots`, solids use
   // `labels`).
   Kokkos::parallel_for(
@@ -400,54 +180,17 @@ inline std::vector<int> segment_volume_k(const std::vector<float>& sdf_h,
 // Device core: takes the (device-resident) segmentation View directly — no re-upload.
 inline std::vector<std::pair<int, int>> extractTopologyView(const Kokkos::View<int*, Mem>& seg,
                                                             std::array<int, 3> resolution) {
-  const I3 res{resolution[0], resolution[1], resolution[2]};
+  const GridGeo geo = GridGeo::of(I3{resolution[0], resolution[1], resolution[2]});
   const std::size_t n = seg.extent(0);
-  const int max_pairs = (int)(n * 3);
-
+  const Index max_pairs = Index(n) * 3;
   Kokkos::View<int*, Mem> pairs("pairs",
                                 (std::size_t)max_pairs * 2);  // flattened (l1,l2) interleaved
   Kokkos::View<int, Mem> cnt("cnt");
   Kokkos::deep_copy(cnt, 0);
-
   Exec space;
-  using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
-  Kokkos::parallel_for(
-      "pnm::boundary_pairs", MD(space, {0, 0, 0}, {res.x, res.y, res.z}),
-      KOKKOS_LAMBDA(int ix, int iy, int iz) {
-        const int idx = get_idx(ix, iy, iz, res);
-        const int my = seg(idx);
-        const int dx_l[3] = {1, 0, 0}, dy_l[3] = {0, 1, 0}, dz_l[3] = {0, 0, 1};
-        for (int k = 0; k < 3; ++k) {
-          const int nl = seg(get_idx(ix + dx_l[k], iy + dy_l[k], iz + dz_l[k], res));
-          if (my != nl) {
-            const int l1 = my < nl ? my : nl, l2 = my < nl ? nl : my;
-            const int slot = Kokkos::atomic_fetch_add(&cnt(), 1);
-            if (slot < max_pairs) {
-              pairs(2 * slot) = l1;
-              pairs(2 * slot + 1) = l2;
-            }
-          }
-        }
-      });
-  space.fence();
-
-  int h_count = 0;
-  {
-    auto hc = Kokkos::create_mirror_view(cnt);
-    Kokkos::deep_copy(hc, cnt);
-    h_count = hc();
-  }
-  if (h_count > max_pairs)
-    h_count = max_pairs;
-  std::vector<int> flat =
-      downloadN(pairs, static_cast<std::size_t>(2 * h_count));  // only the used slots
-  std::vector<std::pair<int, int>> result;
-  result.reserve(h_count);
-  for (int i = 0; i < h_count; ++i)
-    result.push_back({flat[2 * i], flat[2 * i + 1]});
-  std::sort(result.begin(), result.end());
-  result.erase(std::unique(result.begin(), result.end()), result.end());
-  return result;
+  kernels::boundaryPairs(space, geo, seg, pairs, cnt, max_pairs);
+  const Index h_count = std::min<Index>(readScalar(cnt), max_pairs);
+  return kernels::uniquePairs(pairs, static_cast<std::size_t>(h_count));  // only the used slots
 }
 
 // Host wrapper: upload the segmentation, then run the device core.
@@ -497,13 +240,15 @@ inline NetworkFlow extract_network_flow_k(
     const std::vector<double>& oy_h,
     const std::vector<double>& oz_h,  // pass empty vectors for a fully-open (non-cut-cell) grid
     std::array<double, 3> grad_p) {
+  namespace kn = kernels;
   NetworkFlow out;
   if (sdf_h.empty())
     return out;
   const I3 res{resolution[0], resolution[1], resolution[2]};
+  const GridGeo geo = GridGeo::of(res);
   const std::size_t n = sdf_h.size();
   Exec space;
-  using R1 = Kokkos::RangePolicy<Exec>;
+  using R1 = kn::R1;
 
   Kokkos::View<float*, Mem> sdf("nf::sdf", n);
   uploadVec(sdf_h, sdf);
@@ -511,15 +256,7 @@ inline NetworkFlow extract_network_flow_k(
   Kokkos::View<int*, Mem> seg = segmentVolumeView(sdf, resolution, spacing, &roots);
 
   // number of pore labels
-  int np = 0;
-  Kokkos::parallel_reduce(
-      "nf::np", R1(space, 0, n),
-      KOKKOS_LAMBDA(std::size_t i, int& m) {
-        if (seg(i) > m)
-          m = seg(i);
-      },
-      Kokkos::Max<int>(np));
-  space.fence();
+  const int np = kn::maxLabel(space, geo, seg);
   if (np == 0)
     return out;
 
@@ -535,31 +272,12 @@ inline NetworkFlow extract_network_flow_k(
   {
     const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
     const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
-    const I3 r = res;
+    const GridGeo g = geo;
     Kokkos::parallel_for(
         "nf::centers", R1(space, 0, np), KOKKOS_LAMBDA(int k) {
-          const int ci = peak(k);
-          const int ix = ci % r.x, iy = (ci / r.x) % r.y, iz = ci / (r.x * r.y);
-          float sw = 0.0f, px = 0.0f, py = 0.0f, pz = 0.0f;
-          for (int dz = -1; dz <= 1; ++dz)
-            for (int dy = -1; dy <= 1; ++dy)
-              for (int dx = -1; dx <= 1; ++dx) {
-                const float v = sdf(get_idx(ix + dx, iy + dy, iz + dz, r));
-                float w = v > 0.0f ? v : 0.0f;
-                w = w * w;
-                sw += w;
-                px += dx * w;
-                py += dy * w;
-                pz += dz * w;
-              }
-          float fx = 0, fy = 0, fz = 0;
-          if (sw > 1e-6f) {
-            fx = px / sw;
-            fy = py / sw;
-            fz = pz / sw;
-          }
-          poresD(k) =
-              Pore{oxo + (ix + fx) * sx, oyo + (iy + fy) * sy, ozo + (iz + fz) * sz, sdf(ci)};
+          int ix, iy, iz;
+          g.ownedCoords(peak(k), ix, iy, iz);
+          poresD(k) = kn::poreAt(g, sdf, ix, iy, iz, oxo, oyo, ozo, sx, sy, sz);
         });
     space.fence();
   }
@@ -583,27 +301,12 @@ inline NetworkFlow extract_network_flow_k(
   {
     const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
     const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
-    const I3 r = res;
+    const GridGeo g = geo;
     Kokkos::parallel_for(
         "nf::pore_pressure", R1(space, 0, np), KOKKOS_LAMBDA(int k) {
           const Pore po = poresD(k);
-          const double g[3] = {(po.x - oxo) / sx, (po.y - oyo) / sy, (po.z - ozo) / sz};
-          int b[3];
-          double f[3];
-          for (int a = 0; a < 3; ++a) {
-            const double fl = Kokkos::floor(g[a]);
-            b[a] = static_cast<int>(fl);
-            f[a] = g[a] - fl;
-          }
-          double acc = 0.0;
-          for (int dz = 0; dz < 2; ++dz)
-            for (int dy = 0; dy < 2; ++dy)
-              for (int dx = 0; dx < 2; ++dx) {
-                const double wt =
-                    (dx ? f[0] : 1.0 - f[0]) * (dy ? f[1] : 1.0 - f[1]) * (dz ? f[2] : 1.0 - f[2]);
-                acc += wt * p(get_idx(b[0] + dx, b[1] + dy, b[2] + dz, r));
-              }
-          ppres(k) = acc;
+          const double gp[3] = {(po.x - oxo) / sx, (po.y - oyo) / sy, (po.z - ozo) / sz};
+          ppres(k) = kn::trilinear(g, p, gp);
         });
     space.fence();
   }
@@ -619,45 +322,16 @@ inline NetworkFlow extract_network_flow_k(
   // cell to the pore basin whose flow it carries; deep solid ends at a solid peak (negative
   // label) and carries no flux.
   Kokkos::View<int*, Mem> flowLab("nf::flowLab", n);
-  {
-    const I3 r = res;
-    Kokkos::parallel_for(
-        "nf::flow_basins", R1(space, 0, n), KOKKOS_LAMBDA(std::size_t i0) {
-          int walker = static_cast<int>(i0);
-          const int MAX_STEPS = 512;
-          for (int s0 = 0; s0 < MAX_STEPS; ++s0) {
-            int best = walker;
-            float bv = sdf(walker);
-            const int wx = walker % r.x, wy = (walker / r.x) % r.y, wz = walker / (r.x * r.y);
-            for (int dz = -1; dz <= 1; ++dz)
-              for (int dy = -1; dy <= 1; ++dy)
-                for (int dx = -1; dx <= 1; ++dx) {
-                  if (dx == 0 && dy == 0 && dz == 0)
-                    continue;
-                  const int ni = get_idx(wx + dx, wy + dy, wz + dz, r);
-                  const float nv = sdf(ni);
-                  if (nv > bv) {
-                    bv = nv;
-                    best = ni;
-                  } else if (nv == bv && ni > best)
-                    best = ni;
-                }
-            if (best == walker)
-              break;
-            walker = best;
-          }
-          flowLab(i0) = seg(walker);  // seg at a pore peak == its pore label id
-        });
-    space.fence();
-  }
+  kn::gradientWalk(
+      space, geo, sdf, true, KOKKOS_LAMBDA(Index i, Index walker) {
+        flowLab(i) = seg(walker);  // seg at a pore peak == its pore label id
+      });
 
   // ---- per-patch throats: CCL over the interface FACES -------------------------------------
   // A throat is a CONNECTED patch of open interface faces, not the whole label pair: two pores
   // touching at two disjoint places (e.g. once directly and once through the periodic wrap) are
   // two parallel throats — pair-keyed, their fluxes would merge and can cancel. Faces are
-  // identified by fid = 3*cell + d (the +d face of `cell`); two interface faces of the SAME pair
-  // connect when their (doubled) center offset satisfies |2*dc + e_d' - e_d|^2 <= 8 — a generous
-  // edge/corner adjacency in pure integer arithmetic (periodic-safe, decomposition-independent).
+  // identified by fid = 3*cell + d (the +d face of `cell`); adjacency is kernels::facesAdjacent.
   // Each patch is keyed by its minimum fid, so the throat list is grid-deterministic.
   // Two-tier patching: CORE faces — both cells FLUID-centered (sdf > 0) — define the patches by
   // CCL; FILM faces (at least one solid-centered cell; they exist only because the flow basins
@@ -668,331 +342,104 @@ inline NetworkFlow extract_network_flow_k(
   // by a wall film whose staircase faces reach openness ~0.7). Films reaching no core patch
   // become their own patches. Every interface face lands in exactly one patch — exact bookkeeping.
   const std::size_t nf = 3 * n;
-  constexpr std::int64_t kSent = 0x7ffffffffffffffeLL;
-  Kokkos::View<std::int64_t*, Mem> fpar("nf::fpar", nf);    // final patch label per face, -1 = none
-  Kokkos::View<std::int64_t*, Mem> fpair("nf::fpair", nf);  // (lo<<32|hi) pair key per face
+  Kokkos::View<Index*, Mem> fpar("nf::fpar", nf);    // final patch label per face, -1 = none
+  Kokkos::View<Index*, Mem> fpair("nf::fpair", nf);  // (lo<<32|hi) pair key per face
   {
-    const I3 r = res;
-    const bool ho = hasOpen;
-    using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
-    const auto full3 = MD(space, {0, 0, 0}, {r.x, r.y, r.z});
-    Kokkos::View<std::int64_t*, Mem> par("nf::fccl", nf);  // CCL parents (core, then leftover)
+    Kokkos::View<Index*, Mem> par("nf::fccl", nf);  // CCL parents (core, then leftover)
     Kokkos::View<char*, Mem> core("nf::fcore", nf);
-    Kokkos::parallel_for(
-        "nf::face_init", full3, KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
-          const int c = get_idx(ixx, iyy, izz, r);
-          for (int d = 0; d < 3; ++d) {
-            const std::int64_t f = 3 * std::int64_t(c) + d;
-            const int nb = get_idx(ixx + (d == 0), iyy + (d == 1), izz + (d == 2), r);
-            const int a = flowLab(c), b = flowLab(nb);
-            const double opn = ho ? (d == 0 ? ox(nb) : (d == 1 ? oy(nb) : oz(nb))) : 1.0;
-            const bool itf = (a != b && a > 0 && b > 0 && opn > 0.0);
-            core(f) = (itf && sdf(c) > 0.0f && sdf(nb) > 0.0f) ? 1 : 0;
-            par(f) = core(f) ? f : -1;
-            fpar(f) = itf ? (core(f) ? f : kSent) : -1;  // film: sentinel until attached
-            fpair(f) = itf ? ((std::int64_t(a < b ? a : b) << 32) | (a < b ? b : a)) : -1;
-          }
-        });
-    space.fence();
     Kokkos::View<int, Mem> changed("nf::fchanged");
+    kn::faceInit(space, geo, flowLab, sdf, ox, oy, oz, hasOpen, core, par, fpair);
     // one CCL fixpoint over the faces with par >= 0 (used twice: core tier, then leftover films)
     auto cclPass = [&]() {
-      int h_changed = 1;
-      while (h_changed) {
-        Kokkos::deep_copy(changed, 0);
-        Kokkos::parallel_for(
-            "nf::face_merge", full3, KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
-              const int c = get_idx(ixx, iyy, izz, r);
-              for (int d = 0; d < 3; ++d) {
-                const std::int64_t f = 3 * std::int64_t(c) + d;
-                if (par(f) < 0)
-                  continue;
-                const std::int64_t pk = fpair(f);
-                for (int dz = -1; dz <= 1; ++dz)
-                  for (int dy = -1; dy <= 1; ++dy)
-                    for (int dx = -1; dx <= 1; ++dx) {
-                      const int c2 = get_idx(ixx + dx, iyy + dy, izz + dz, r);
-                      for (int d2 = 0; d2 < 3; ++d2) {
-                        const std::int64_t f2 = 3 * std::int64_t(c2) + d2;
-                        if (f2 == f || par(f2) < 0 || fpair(f2) != pk)
-                          continue;
-                        const int Dx = 2 * dx + (d2 == 0) - (d == 0);
-                        const int Dy = 2 * dy + (d2 == 1) - (d == 1);
-                        const int Dz = 2 * dz + (d2 == 2) - (d == 2);
-                        if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
-                          continue;
-                        std::int64_t rm = f;
-                        while (rm != par(rm))
-                          rm = par(rm);
-                        std::int64_t rn = f2;
-                        while (rn != par(rn))
-                          rn = par(rn);
-                        if (rm != rn) {
-                          const std::int64_t sml = rm < rn ? rm : rn, lrg = rm < rn ? rn : rm;
-                          Kokkos::atomic_min(&par(lrg), sml);
-                          changed() = 1;
-                        }
-                      }
-                    }
-              }
-            });
-        space.fence();
-        Kokkos::parallel_for(
-            "nf::face_flatten", Kokkos::RangePolicy<Exec>(space, 0, nf),
-            KOKKOS_LAMBDA(std::size_t f) {
-              std::int64_t l = par(f);
-              if (l >= 0) {
-                while (l != par(l))
-                  l = par(l);
-                par(f) = l;
-              }
-            });
-        space.fence();
-        auto hc = Kokkos::create_mirror_view(changed);
-        Kokkos::deep_copy(hc, changed);
-        h_changed = hc();
-      }
+      kn::cclFixpoint(space, par, nf, changed,
+                      [&]() { kn::faceMerge(space, geo, par, fpair, changed); });
+    };
+    // single-rank: the CCL root IS the min fid of the patch (parents are fids, union-by-min)
+    auto rootOf = KOKKOS_LAMBDA(Index parent) {
+      return parent;
     };
     cclPass();  // core tier
-    Kokkos::parallel_for(
-        "nf::core_label", Kokkos::RangePolicy<Exec>(space, 0, nf), KOKKOS_LAMBDA(std::size_t f) {
-          if (core(f))
-            fpar(f) = par(f);
-        });
-    space.fence();
+    kn::faceLabelCore(space, nf, par, fpair, fpar, rootOf);
     // film attachment: min reachable core-patch label, propagated through films (Jacobi min)
+    const kn::FlatFaces<Kokkos::View<Index*, Mem>> nbLab{fpar}, nbPair{fpair};
     int h_changed = 1;
     while (h_changed) {
       Kokkos::deep_copy(changed, 0);
-      Kokkos::parallel_for(
-          "nf::film_attach", full3, KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
-            const int c = get_idx(ixx, iyy, izz, r);
-            for (int d = 0; d < 3; ++d) {
-              const std::int64_t f = 3 * std::int64_t(c) + d;
-              if (fpar(f) < 0 || core(f))
-                continue;
-              std::int64_t best = fpar(f);
-              const std::int64_t pk = fpair(f);
-              for (int dz = -1; dz <= 1; ++dz)
-                for (int dy = -1; dy <= 1; ++dy)
-                  for (int dx = -1; dx <= 1; ++dx) {
-                    const int c2 = get_idx(ixx + dx, iyy + dy, izz + dz, r);
-                    for (int d2 = 0; d2 < 3; ++d2) {
-                      const std::int64_t f2 = 3 * std::int64_t(c2) + d2;
-                      if (f2 == f || fpair(f2) != pk)
-                        continue;
-                      const std::int64_t l2 = fpar(f2);
-                      if (l2 < 0 || l2 >= kSent || l2 >= best)
-                        continue;
-                      const int Dx = 2 * dx + (d2 == 0) - (d == 0);
-                      const int Dy = 2 * dy + (d2 == 1) - (d == 1);
-                      const int Dz = 2 * dz + (d2 == 2) - (d == 2);
-                      if (Dx * Dx + Dy * Dy + Dz * Dz > 8)
-                        continue;
-                      best = l2;
-                    }
-                  }
-              if (best < fpar(f)) {
-                fpar(f) = best;
-                changed() = 1;
-              }
-            }
-          });
-      space.fence();
-      auto hc = Kokkos::create_mirror_view(changed);
-      Kokkos::deep_copy(hc, changed);
-      h_changed = hc();
+      kn::filmAttachSweep(space, geo, fpar, fpair, core, nbLab, nbPair, changed);
+      h_changed = readScalar(changed);
     }
     // leftover films (no core patch reachable): their own patches by a second CCL tier
-    Kokkos::parallel_for(
-        "nf::leftover_init", Kokkos::RangePolicy<Exec>(space, 0, nf),
-        KOKKOS_LAMBDA(std::size_t f) { par(f) = (fpar(f) == kSent) ? std::int64_t(f) : -1; });
-    space.fence();
+    kn::leftoverInit(space, nf, fpar, par);
     cclPass();
-    Kokkos::parallel_for(
-        "nf::leftover_label", Kokkos::RangePolicy<Exec>(space, 0, nf),
-        KOKKOS_LAMBDA(std::size_t f) {
-          if (fpar(f) == kSent)
-            fpar(f) = par(f);
-        });
-    space.fence();
+    kn::faceLabelLeftover(space, nf, par, fpar, rootOf);
   }
   // unique patch roots -> throat slots, ordered by (pair, root fid)
-  std::vector<std::int64_t> rootF, rootSlotKey;
+  kn::ThroatSlots slots;
   {
-    Kokkos::View<std::int64_t*, Mem> rbuf("nf::rbuf", nf ? nf : 1), pbuf("nf::pbuf", nf ? nf : 1);
+    Kokkos::View<Index*, Mem> rbuf("nf::rbuf", nf ? nf : 1), pbuf("nf::pbuf", nf ? nf : 1);
     Kokkos::View<int, Mem> rcnt("nf::rcnt");
     Kokkos::deep_copy(rcnt, 0);
     Kokkos::parallel_for(
-        "nf::face_roots", Kokkos::RangePolicy<Exec>(space, 0, nf), KOKKOS_LAMBDA(std::size_t f) {
-          if (fpar(f) == std::int64_t(f)) {
+        "nf::face_roots", R1(space, 0, nf), KOKKOS_LAMBDA(std::size_t f) {
+          if (fpar(f) == Index(f)) {
             const int s0 = Kokkos::atomic_fetch_add(&rcnt(), 1);
             rbuf(s0) = f;
             pbuf(s0) = fpair(f);
           }
         });
     space.fence();
-    auto hc = Kokkos::create_mirror_view(rcnt);
-    Kokkos::deep_copy(hc, rcnt);
-    auto hr = downloadN(rbuf, std::size_t(hc()));
-    auto hp = downloadN(pbuf, std::size_t(hc()));
-    std::vector<std::size_t> ord(hr.size());
-    for (std::size_t i = 0; i < ord.size(); ++i)
-      ord[i] = i;
-    std::sort(ord.begin(), ord.end(), [&](std::size_t a, std::size_t b) {
-      return hp[a] != hp[b] ? hp[a] < hp[b] : hr[a] < hr[b];
-    });
-    for (auto i : ord) {
-      out.throats.push_back({int(hp[i] >> 32), int(hp[i] & 0x7fffffff)});
-      rootF.push_back(hr[i]);
-    }
-    // (root fid -> slot) sorted by root fid for the device lookup
-    rootSlotKey = rootF;
-    std::sort(rootSlotKey.begin(), rootSlotKey.end());
+    const std::size_t nr = std::size_t(readScalar(rcnt));
+    auto hr = downloadN(rbuf, nr);
+    auto hp = downloadN(pbuf, nr);
+    std::vector<std::pair<Index, Index>> rootPair(nr);
+    for (std::size_t i = 0; i < nr; ++i)
+      rootPair[i] = {hr[i], hp[i]};
+    slots = kn::throatSlots(std::move(rootPair));
   }
+  out.throats = slots.throats;
   const std::size_t nt = out.throats.size();
-  std::vector<int> slotOf(nt);  // position in rootSlotKey -> throat slot
-  for (std::size_t t = 0; t < nt; ++t) {
-    const auto it = std::lower_bound(rootSlotKey.begin(), rootSlotKey.end(), rootF[t]);
-    slotOf[std::size_t(it - rootSlotKey.begin())] = int(t);
-  }
-  Kokkos::View<std::int64_t*, Mem> keyD("nf::keys", nt);
+  Kokkos::View<Index*, Mem> keyD("nf::keys", nt);
   Kokkos::View<int*, Mem> slotD("nf::slots", nt);
-  uploadVec(rootSlotKey, keyD);
-  uploadVec(slotOf, slotD);
+  uploadVec(slots.keySorted, keyD);
+  uploadVec(slots.slotOf, slotD);
+
+  // Min-image anchor per pore: its PEAK VOXEL center — integer coordinates, so the periodic-image
+  // branch is deterministic (the refined float centroid wobbles ~1e-8 under CUDA FMA
+  // contraction, which flips the image of faces exactly half a period away — measured on a
+  // symmetric sphere lattice).
+  const auto peakH = downloadN(peak, static_cast<std::size_t>(np));
+  std::vector<double> ancX(np), ancY(np), ancZ(np);
+  for (int k = 0; k < np; ++k) {
+    const int pk = peakH[k];
+    ancX[k] = origin[0] + (pk % res.x) * double(spacing[0]);
+    ancY[k] = origin[1] + ((pk / res.x) % res.y) * double(spacing[1]);
+    ancZ[k] = origin[2] + (pk / (res.x * res.y)) * double(spacing[2]);
+  }
+  Kokkos::View<double*, Mem> ancXD("nf::ancX", np), ancYD("nf::ancY", np), ancZD("nf::ancZ", np);
+  uploadVec(ancX, ancXD);
+  uploadVec(ancY, ancYD);
+  uploadVec(ancZ, ancZD);
 
   // accumulate: openness-weighted MAC face fluxes over every flow-basin boundary face, plus the
-  // area-weighted throat centroid (min-imaged relative to the lower pore's center).
+  // area-weighted throat centroid (min-imaged relative to the lower pore's anchor).
   Kokkos::View<double*, Mem> Q("nf::Q", nt), A("nf::A", nt), resid("nf::resid", np);
   Kokkos::View<double*, Mem> Cx("nf::Cx", nt), Cy("nf::Cy", nt), Cz("nf::Cz", nt);
-  {
-    const double Ax = double(spacing[1]) * spacing[2], Ay = double(spacing[0]) * spacing[2],
-                 Az = double(spacing[0]) * spacing[1];
-    const I3 r = res;
-    const std::int64_t ntl = static_cast<std::int64_t>(nt);
-    const bool ho = hasOpen;
-    const float oxo = origin[0], oyo = origin[1], ozo = origin[2];
-    const float sx = spacing[0], sy = spacing[1], sz = spacing[2];
-    const double Lx = double(r.x) * sx, Ly = double(r.y) * sy, Lz = double(r.z) * sz;
-    // Min-image anchor per throat: the LOWER pore's PEAK VOXEL center — integer coordinates, so
-    // the periodic-image branch is deterministic (the refined float centroid wobbles ~1e-8 under
-    // CUDA FMA contraction, which flips the image of faces exactly half a period away —
-    // measured on a symmetric sphere lattice).
-    auto peakl = peak;
-    using MD = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>;
-    Kokkos::parallel_for(
-        "nf::throat_flux", MD(space, {0, 0, 0}, {r.x, r.y, r.z}),
-        KOKKOS_LAMBDA(int ixx, int iyy, int izz) {
-          const int c = get_idx(ixx, iyy, izz, r);
-          const int a = flowLab(c);
-          for (int d = 0; d < 3; ++d) {
-            const int nb = get_idx(ixx + (d == 0), iyy + (d == 1), izz + (d == 2), r);
-            const int b = flowLab(nb);
-            if (a == b)
-              continue;
-            // the shared face is the -d face of the +d neighbour: velocity/openness live there
-            const double vel = d == 0 ? u(nb) : (d == 1 ? v(nb) : w(nb));
-            const double opn = ho ? (d == 0 ? ox(nb) : (d == 1 ? oy(nb) : oz(nb))) : 1.0;
-            const double area = d == 0 ? Ax : (d == 1 ? Ay : Az);
-            const double q = opn * vel * area;  // positive = flow from c to the +d neighbour
-            if (a > 0)
-              Kokkos::atomic_add(&resid(a - 1), q);
-            if (b > 0)
-              Kokkos::atomic_add(&resid(b - 1), -q);
-            const std::int64_t rt = fpar(3 * std::int64_t(c) + d);  // patch root, -1 = no throat
-            if (rt >= 0) {
-              // binary search the sorted patch roots -> throat slot
-              std::int64_t l = 0, hgh = ntl - 1, slot = -1;
-              while (l <= hgh) {
-                const std::int64_t mid = l + (hgh - l) / 2;
-                if (keyD(mid) == rt) {
-                  slot = slotD(mid);
-                  break;
-                }
-                if (keyD(mid) < rt)
-                  l = mid + 1;
-                else
-                  hgh = mid - 1;
-              }
-              const int lo = a < b ? a : b;
-              if (slot >= 0) {
-                const double w0 = opn * area;
-                Kokkos::atomic_add(&Q(slot), a < b ? q : -q);
-                Kokkos::atomic_add(&A(slot), w0);
-                // face center, min-imaged relative to the lower pore's peak voxel center
-                const int pk = peakl(lo - 1);
-                const int pkx = pk % r.x, pky = (pk / r.x) % r.y, pkz = pk / (r.x * r.y);
-                double fp[3] = {oxo + (ixx + (d == 0 ? 0.5 : 0.0)) * double(sx),
-                                oyo + (iyy + (d == 1 ? 0.5 : 0.0)) * double(sy),
-                                ozo + (izz + (d == 2 ? 0.5 : 0.0)) * double(sz)};
-                const double pc[3] = {oxo + pkx * double(sx), oyo + pky * double(sy),
-                                      ozo + pkz * double(sz)};
-                const double Lw[3] = {Lx, Ly, Lz};
-                for (int a2 = 0; a2 < 3; ++a2) {
-                  double dv = fp[a2] - pc[a2];
-                  dv -= Lw[a2] * Kokkos::round(dv / Lw[a2]);
-                  fp[a2] = dv;
-                }
-                Kokkos::atomic_add(&Cx(slot), w0 * fp[0]);
-                Kokkos::atomic_add(&Cy(slot), w0 * fp[1]);
-                Kokkos::atomic_add(&Cz(slot), w0 * fp[2]);
-              }
-            }
-          }
-        });
-    space.fence();
-  }
-  std::vector<double> hcx, hcy, hcz;
+  kn::throatFlux(space, geo, flowLab, u, v, w, ox, oy, oz, hasOpen, fpar, keyD, slotD, nt, ancXD,
+                 ancYD, ancZD, origin, spacing, resolution, Q, A, Cx, Cy, Cz, resid);
+  std::vector<double> hcx = downloadN(Cx, nt), hcy = downloadN(Cy, nt), hcz = downloadN(Cz, nt);
   {
     auto hq = downloadN(Q, nt);
     auto ha = downloadN(A, nt);
     auto hr = downloadN(resid, static_cast<std::size_t>(np));
-    hcx = downloadN(Cx, nt);
-    hcy = downloadN(Cy, nt);
-    hcz = downloadN(Cz, nt);
     out.throat_flow.assign(hq.begin(), hq.end());
     out.throat_area.assign(ha.begin(), ha.end());
     out.pore_residual.assign(hr.begin(), hr.end());
   }
 
-  // total-pressure drop per throat: periodic parts + the macroscopic gradient along the throat-
-  // anchored two-leg min-image path i -> throat centroid -> j. (The Voronoi original used a
-  // single min-image between the pore centers; anchoring at the throat disambiguates pores at
-  // exactly half the period and follows the physical path of THIS interface.)
-  out.throat_dp.resize(nt);
-  const double L[3] = {double(res.x) * spacing[0], double(res.y) * spacing[1],
-                       double(res.z) * spacing[2]};
-  const auto peakH = downloadN(peak, static_cast<std::size_t>(np));
-  for (std::size_t t = 0; t < nt; ++t) {
-    const int li = out.throats[t].first, lj = out.throats[t].second;
-    const Pore& pi = out.pores[li - 1];
-    const Pore& pj = out.pores[lj - 1];
-    const double aw = out.throat_area[t];
-    const int pk = peakH[li - 1];
-    const double anc[3] = {origin[0] + (pk % res.x) * double(spacing[0]),
-                           origin[1] + ((pk / res.x) % res.y) * double(spacing[1]),
-                           origin[2] + (pk / (res.x * res.y)) * double(spacing[2])};
-    const int pkj = peakH[lj - 1];
-    const double ancj[3] = {origin[0] + (pkj % res.x) * double(spacing[0]),
-                            origin[1] + ((pkj / res.x) % res.y) * double(spacing[1]),
-                            origin[2] + (pkj / (res.x * res.y)) * double(spacing[2])};
-    double macro = 0.0;
-    const double pip[3] = {double(pi.x), double(pi.y), double(pi.z)};
-    const double pjp[3] = {double(pj.x), double(pj.y), double(pj.z)};
-    const int N[3] = {res.x, res.y, res.z};
-    for (int a = 0; a < 3; ++a) {
-      // Two-leg path i -> throat -> j; every position term cancels except the integer periodic
-      // image count k, which is decided in SNAPPED integer-cell arithmetic (peak-voxel anchors +
-      // the bias-rounded throat centroid) so float wobble (refined centroids ~1e-8, atomic sum
-      // order ~1e-13) can never flip the image branch.
-      const double ct = (hcx[t] * (a == 0) + hcy[t] * (a == 1) + hcz[t] * (a == 2)) / aw;
-      const long long Dc = llround((ancj[a] - anc[a]) / double(spacing[a])) -
-                           llround(ct / double(spacing[a]) + 1e-6);
-      const long long k = llround(double(Dc) / N[a]);
-      macro += grad_p[a] * ((pjp[a] - pip[a]) - L[a] * double(k));
-    }
-    out.throat_dp[t] = (out.pore_pressure[li - 1] - out.pore_pressure[lj - 1]) - macro;
-  }
+  // total-pressure drop per throat (throat-anchored two-leg min-image path)
+  out.throat_dp =
+      kn::throatPressureDrops(out.throats, out.pores, out.pore_pressure, out.throat_area, hcx, hcy,
+                              hcz, ancX, ancY, ancZ, spacing, resolution, grad_p);
   return out;
 }
 
