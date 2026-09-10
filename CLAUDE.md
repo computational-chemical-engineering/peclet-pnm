@@ -25,12 +25,19 @@ is pure C++. Part of the peclet suite (see `../CLAUDE.md` and `../docs/` for sui
   device-resident buffers, the fixpoint loops (trivial sync), the device scan renumbering, the
   per-pore network-flow kernels (peak/centre/pressure) and the host topology sort/unique. Device
   kernels live in `.hpp` compiled as C++ (never `.cu`).
-- `pnm_bindings.cpp` — the nanobind module `peclet.pnm._pnm`: `SDFReader`, `Pore`, `extract_pores`,
-  `segment_volume`, `extract_topology`, the fused `extract_pore_network` (SDF uploaded once,
-  segmentation device-resident across stages), `extract_network_flow`, and under `PECLET_PNM_MPI`
-  `mpi_rank`/`mpi_size`/`mpi_block` + `extract_pore_network_mpi`/`extract_network_flow_mpi`. Uses
-  core's zero-copy View↔ndarray bridge. Every z-y-x triple argument carries the `_zyx` suffix
-  (`origin_zyx`, `spacing_zyx`, `shape_zyx`, `global_shape_zyx`, `grad_p_zyx`; NAMING.md §1.7) —
+- `pnm_bindings.cpp` — the nanobind module `peclet.pnm._pnm`: `SDFReader`, `Pore`, `extract_pores`
+  (→ `list[Pore]`), `segment_volume` (→ int32 `(Nz,Ny,Nx)` ndarray), `extract_topology` (3-D or
+  flat int32 array in, zero-copy → `(M,2)` int32 ndarray), the fused `extract_pore_network` (SDF
+  uploaded once, segmentation device-resident across stages → `(pores, seg, connections)` with
+  the same three types), `extract_network_flow` (→ dict: `pores` list, `throats` `(M,2)` int32,
+  five float64 arrays), and under `PECLET_PNM_MPI` `mpi_block` (→ `(offset_zyx, shape_zyx)`, two
+  int 3-tuples in VOXELS — not the physical `origin_zyx`) + `extract_pore_network_mpi` /
+  `extract_network_flow_mpi`. The host vectors are moved into capsule-owned NumPy arrays
+  (`vector_to_ndarray`, core's zero-copy bridge) — never `std::vector` → `list` boxing
+  (QUALITY_PLAN F, 2026-09-10: a 256³ segmentation used to come back as 16.7 M Python ints).
+  `mpi_rank()`/`mpi_size()` were removed at 1.0.0 (mpi4py's job). Every z-y-x triple argument
+  carries the `_zyx` suffix (`origin_zyx`, `spacing_zyx`, `shape_zyx`, `global_shape_zyx`,
+  `grad_p_zyx`; NAMING.md §1.7; `Pore.x/y/z` are self-named scalars, the recorded exception) —
   `extract_topology_gpu(shape=)` was removed at 1.0.0 (the `_gpu` suffix was a CUDA-era leftover).
   Precision: float32 SDF + geometry kernels, `origin_zyx`/`spacing_zyx` narrowed double→float32,
   float64 MAC fields in the network-flow extraction.
@@ -90,8 +97,8 @@ by the suite's release pre-flight). Without a prefix, `cmake/PecletDeps.cmake` v
 via FetchContent (self-contained wheel path, `PECLET_VENDOR_DEPS=ON` in cibuildwheel). Keep the
 `PECLET_*_TAG` pins in lockstep with `../tools/bootstrap_deps.sh`.
 
-Multi-rank (MPI): add `-DPECLET_PNM_MPI=ON` to expose `mpi_rank`/`mpi_size`/`mpi_block` +
-`extract_pore_network_mpi` (collective; see README).
+Multi-rank (MPI): add `-DPECLET_PNM_MPI=ON` to expose `mpi_block` + `extract_pore_network_mpi` /
+`extract_network_flow_mpi` (collective; see README).
 
 **Tests** (`-DPECLET_PNM_BUILD_TESTS=ON`, OFF by default so wheel builds are unaffected; ON in CI).
 One tree per backend — the test targets reuse the module's resolved Kokkos/MPI targets and core
@@ -117,6 +124,12 @@ OMP_NUM_THREADS=4 OMP_PROC_BIND=false ctest --test-dir build_dev --output-on-fai
 - `pnm_mpi_np{1,2,4}` / `pnm_flow_mpi_np{1,2,4}` (`tests/kokkos_mpi`, only with `PECLET_PNM_MPI`):
   distributed vs single-rank oracle, bit-exact. `-DMPIEXEC_PREFLAGS=--oversubscribe` for a small
   runner.
+- `tests/regression/state_hash.py` (not a ctest; run by hand at OMP_NUM_THREADS=1, which it pins
+  itself): the **byte gate** — SHA-256 of every output of every public entry path (pores, int32
+  segmentation, `(M,2)` connections, the network-flow arrays; single-rank staged + fused, and
+  np=2 via its own `mpirun` re-launch) on the sphere lattice and on packing_ring. Any refactor of
+  the bindings or the kernels must reproduce its output line for line; the hashes at each gate are
+  in the commit messages (first: the F commit of 2026-09-10).
 The synthetic generators are shared in `tests/synthetic_sdf.hpp` (`pnm::test::`). Each
 `tests/*/CMakeLists.txt` also still configures standalone (`cmake -S tests/kokkos_mpi -B …`, core
 via `cmake/PecletDeps.cmake`, so it works outside the suite tree too).
@@ -130,7 +143,9 @@ sweep-for-sweep; don't "optimize" it back to in-place.
 
 - SDF sign: **negative inside solid**, positive in the pore space (suite-wide).
 - Python arrays are `(Nz, Ny, Nx)` C-order (x fastest — contiguous with the flat x-fastest layout);
-  `origin`/`spacing` tuples are **z-y-x**. `segment_volume` returns a flat label vector.
+  `origin`/`spacing` tuples are **z-y-x**. `segment_volume` returns the labels as an int32 array of
+  that shape (the kernels' flat vector re-shaped in place); `extract_topology` accepts it directly
+  (or a flat vector plus `shape_zyx=`).
 - `Kokkos::initialize` happens at import; `Kokkos::finalize` is registered via `atexit`
   (REQUIRED on CUDA — see the comment in `pnm_bindings.cpp`).
 - **The library never prints** (QUALITY_PLAN §3.H.6): there is no `cout`/`cerr`/`fprintf` in

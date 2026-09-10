@@ -47,9 +47,9 @@ import peclet.pnm as pnm
 
 sdf_3d, origin_zyx, spacing_zyx = pnm.SDFReader.read_vti("packing.vti")  # (Nz,Ny,Nx) C-order
 pores = pnm.extract_pores(sdf_3d, origin_zyx, spacing_zyx)               # Pore(x,y,z,radius) list
-seg = pnm.segment_volume(sdf_3d, spacing_zyx)                            # flat per-voxel label
-conns = pnm.extract_topology(seg, shape_zyx=sdf_3d.shape)               # [(label_a, label_b), ...]
-throats = [(a, b) for a, b in conns if a > 0 and b > 0]                  # pore-pore pairs only
+seg = pnm.segment_volume(sdf_3d, spacing_zyx)                            # int32 (Nz,Ny,Nx) labels
+conns = pnm.extract_topology(seg)                                        # (M,2) int32 label pairs
+throats = conns[(conns[:, 0] > 0) & (conns[:, 1] > 0)]                   # pore-pore pairs only
 
 # or fused (SDF uploaded once, segmentation stays device-resident across stages):
 pores, seg, conns = pnm.extract_pore_network(sdf_3d, origin_zyx, spacing_zyx)
@@ -58,6 +58,11 @@ pores, seg, conns = pnm.extract_pore_network(sdf_3d, origin_zyx, spacing_zyx)
 Conventions: the SDF array is `(Nz, Ny, Nx)` C-order (x fastest) and every triple that describes
 it (`origin_zyx`, `spacing_zyx`, `shape_zyx`, `grad_p_zyx`) is z-y-x, marked by the suffix; SDF
 sign is negative inside the solid — see the suite's `docs/CONVENTIONS.md` and `docs/NAMING.md` §1.7.
+(`Pore.x/y/z` are three self-named scalars, not a triple, so they carry no suffix.) Arrays in,
+arrays out: `segment_volume` returns the labels as an int32 array of the SDF's shape (the kernels'
+flat x-fastest vector re-shaped in place, no copy), `extract_topology` reads that array back
+without a copy and returns the pairs as an `(M, 2)` int32 array, and the network-flow dict holds
+NumPy arrays; only the pores are a Python `list[Pore]`.
 Labels from `segment_volume`: pores `1, 2, …`, solid grains `-1, -2, …`, `0` = unreached solid
 debris. Precision: the SDF is float32 and the geometry kernels compute in float32 (`origin_zyx` /
 `spacing_zyx` are narrowed to float32, so pore centres and radii are float32 in the input unit
@@ -81,12 +86,19 @@ net = pnm.extract_network_flow(
     s.get_uf().T, s.get_vf().T, s.get_wf().T, s.get_p().T,   # zero-copy transposes to zyx
     s.get_ox().T, s.get_oy().T, s.get_oz().T,                # cut-cell face openness
     grad_p_zyx=[0, 0, -fx])                                  # body force f == -grad p_macro
+net["pores"]           # list[Pore] in label order (pores[k] is label k+1)
+net["throats"]         # (M,2) int32 label pairs a < b, one row per interface PATCH
 net["throat_flow"]     # Q through each pore-pore interface (o·u·A summed over MAC faces)
 net["pore_pressure"]   # periodic p interpolated at each pore center (basin SDF peak)
 net["throat_dp"]       # total-pressure drop P_i - P_j (periodic parts + macro gradient
                        # along the throat-anchored min-image path)
 net["pore_residual"]   # signed flux over each pore's whole boundary — ~ solver tolerance
 ```
+
+The openness arrays must be the ones the velocity field was projected with: with peclet.flow's
+cut-cell IBM that requires `set_solid(..., cutcell_pressure=True)` — without it every openness
+flow reports is 0 and every throat flux comes back 0 (the binding cannot check this; the
+precondition lives in the docstring).
 
 On the voxel network the throat integral is exact: a throat is a set of grid-aligned MAC faces
 and the openness-weighted face velocity is the discrete flux carrier, so per-pore mass balance
@@ -134,10 +146,13 @@ decomposition-independent.
 ```python
 # mpirun -np 4 python extract.py
 import peclet.pnm as pnm
-origin, shape = pnm.mpi_block(global_shape_zyx)      # this rank's ORB block of the global grid
-local = sdf[origin[0]:origin[0]+shape[0], origin[1]:origin[1]+shape[1], origin[2]:origin[2]+shape[2]]
+(oz, oy, ox), (sz, sy, sx) = pnm.mpi_block(global_shape_zyx)  # this rank's ORB block, in VOXELS
+local = sdf[oz:oz + sz, oy:oy + sy, ox:ox + sx]
 pores, seg, conns = pnm.extract_pore_network_mpi(local, global_shape_zyx, origin_zyx, spacing_zyx)
-# pores: the pores whose peak this rank owns; seg: this rank's block; conns: global (identical everywhere)
+# pores: the pores whose peak this rank owns; seg: this rank's block (int32, local.shape, global
+# label ids); conns: global (M,2), identical on every rank. origin_zyx stays the GLOBAL grid's
+# physical origin — mpi_block's offset_zyx is an integer voxel offset, a different thing.
+# Rank and size come from mpi4py (MPI.COMM_WORLD.rank / .size); the module has no mpi_rank().
 ```
 
 Validated by `tests/kokkos_mpi` (ctest, np = 1, 2, 4, OpenMP + CUDA): per-voxel segmentation ids,
