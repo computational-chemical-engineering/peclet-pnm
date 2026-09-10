@@ -321,8 +321,10 @@ struct MpiPoreNetwork {
   std::array<int, 3> block_size{0, 0, 0};
 };
 
-/// This rank's ORB block of the global grid (deterministic; same partition as flow/dem).
-inline void mpi_block_of(std::array<int, 3> gdims, MPI_Comm comm, std::array<int, 3>& origin,
+/// This rank's ORB block of the global grid (deterministic; same partition as flow/dem):
+/// `offset` = the block's first voxel index per axis (an integer grid offset, not a physical
+/// origin), `size` = its voxel count per axis.
+inline void mpi_block_of(std::array<int, 3> gdims, MPI_Comm comm, std::array<int, 3>& offset,
                          std::array<int, 3>& size) {
   int rank = 0, nranks = 1;
   MPI_Comm_rank(comm, &rank);
@@ -330,7 +332,7 @@ inline void mpi_block_of(std::array<int, 3> gdims, MPI_Comm comm, std::array<int
   peclet::core::decomp::BlockDecomposer<3> dec(static_cast<std::size_t>(nranks),
                                                IVec<3>{gdims[0], gdims[1], gdims[2]});
   for (int a = 0; a < 3; ++a) {
-    origin[a] = static_cast<int>(dec.origins()[rank][a]);
+    offset[a] = static_cast<int>(dec.origins()[rank][a]);
     size[a] = static_cast<int>(dec.sizes()[rank][a]);
   }
 }

@@ -21,11 +21,7 @@ def verify_segmentation(input_file, output_file, edge_file):
     print(f"Grid Shape (Nz, Ny, Nx): {shape}")
     
     print("Running Segmentation...")
-    # Updated binding accepts the 3D array and ZYX spacing
-    segmentation_flat = pnm.segment_volume(sdf_3d, spacing)
-    
-    # Reshape the flat result to our 3D convention
-    seg_3d = np.array(segmentation_flat, dtype=np.int32).reshape(shape)
+    seg_3d = pnm.segment_volume(sdf_3d, spacing)  # int32 (Nz,Ny,Nx), same shape as the SDF
     
     # Stats logic
     unique_labels = np.unique(seg_3d)
@@ -44,9 +40,9 @@ def verify_segmentation(input_file, output_file, edge_file):
              origin=origin)
     
     print("Extracting Topology...")
-    connections = pnm.extract_topology(segmentation_flat, shape_zyx=shape)
+    connections = pnm.extract_topology(seg_3d)  # (M,2) int32
     print(f"Found {len(connections)} connections "
-          f"({sum(1 for a, b in connections if a > 0 and b > 0)} pore-pore).")
+          f"({int(((connections[:, 0] > 0) & (connections[:, 1] > 0)).sum())} pore-pore).")
     
     with open(edge_file, "w") as f:
         for u, v in connections:

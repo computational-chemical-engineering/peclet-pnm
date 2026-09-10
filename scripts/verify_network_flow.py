@@ -225,11 +225,11 @@ net4 = pnm.extract_network_flow(
 Q4 = np.array(net4["throat_flow"])
 dp4 = np.array(net4["throat_dp"])
 res4 = np.array(net4["pore_residual"])
-th4 = net4["throats"]
+th4 = net4["throats"].tolist()  # (M,2) int32 array -> [[a, b], ...] for the == tests below
 print(f"pores {len(net4['pores'])}, throats {len(Q4)}, F = {F4:.4e}")
 for t, (a, b) in enumerate(th4):
     print(f"  throat {a}-{b}: Q={Q4[t]: .6e} dp={dp4[t]: .4e} A={net4['throat_area'][t]:7.2f}")
-par = [t for t, ab in enumerate(th4) if ab == (1, 2)]
+par = [t for t, ab in enumerate(th4) if ab == [1, 2]]
 check("case4 pore count", len(net4["pores"]) == 3, f"{len(net4['pores'])} (2 chambers + wrap pore)")
 check("case4 parallel pair (1,2) twice", len(par) == 2,
       f"pair (1,2) appears {len(par)}x of {len(Q4)} throats")
@@ -243,7 +243,7 @@ if len(par) == 2:
           f"Q_A = {qA:.3e}, Q_B = {qB:.3e}")
     check("case4 fatter capsule carries more", max(qA, qB) > 1.5 * min(qA, qB),
           f"ratio {max(qA,qB)/min(qA,qB):.2f} (radii 4.5 vs 3)")
-wrapT = [t for t, ab in enumerate(th4) if ab != (1, 2)]
+wrapT = [t for t, ab in enumerate(th4) if ab != [1, 2]]
 check("case4 wrap throats carry F", bool(np.all(np.abs(np.abs(Q4[wrapT]) - abs(F4)) < 1e-3 * abs(F4))),
       f"|Q| = {np.abs(Q4[wrapT]).tolist()}")
 check("case4 g>0 on all throats", bool(np.all(Q4 * dp4 > 0)),

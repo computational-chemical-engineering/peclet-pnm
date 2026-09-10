@@ -32,7 +32,8 @@ def main(path):
     print(f"extract_pores: {len(pores)} pores")
     assert len(pores) == EXPECTED_PORES, len(pores)
     fused, seg, conns = pnm.extract_pore_network(sdf, origin_zyx, spacing_zyx)
-    seg = np.asarray(seg)
+    assert seg.shape == sdf.shape and seg.dtype == np.int32, (seg.shape, seg.dtype)
+    assert conns.shape[1:] == (2,) and conns.dtype == np.int32, (conns.shape, conns.dtype)
     print(f"extract_pore_network: {len(fused)} pores, {len(conns)} connections, "
           f"{seg.max()} pore labels, {-seg.min()} solid labels")
     assert len(fused) == EXPECTED_PORES, len(fused)

@@ -27,7 +27,7 @@ def grid(shape_xyz):
 
 
 def throats(conns):
-    return [c for c in conns if c[0] > 0 and c[1] > 0]
+    return conns[(conns[:, 0] > 0) & (conns[:, 1] > 0)].tolist()
 
 
 def check_one_sphere():
@@ -35,14 +35,20 @@ def check_one_sphere():
     x, y, z = grid((n, n, n))
     sdf = (R - np.sqrt((x - 8) ** 2 + (y - 8) ** 2 + (z - 8) ** 2)).astype(np.float32)
     pores, seg, conns = pnm.extract_pore_network(sdf, [0.0] * 3, [1.0] * 3)
-    seg = np.asarray(seg)
+    assert isinstance(seg, np.ndarray) and seg.dtype == np.int32 and seg.shape == sdf.shape
+    assert isinstance(conns, np.ndarray) and conns.dtype == np.int32 and conns.shape == (1, 2)
     assert len(pores) == 1, pores
     p = pores[0]
     assert p.radius == np.float32(R), p
     assert (p.x, p.y, p.z) == (8.0, 8.0, 8.0), p
     assert seg.max() == 1 and seg.min() == -1 and not (seg == 0).any()
-    assert list(conns) == [(-1, 1)], conns
+    assert conns.tolist() == [[-1, 1]], conns
     assert len(pnm.extract_pores(sdf, [0.0] * 3, [1.0] * 3)) == 1
+    # staged == fused, and extract_topology reads the 3-D int32 array (or the flat vector + shape)
+    seg2 = pnm.segment_volume(sdf, [1.0] * 3)
+    assert seg2.shape == sdf.shape and np.array_equal(seg2, seg)
+    assert np.array_equal(pnm.extract_topology(seg2), conns)
+    assert np.array_equal(pnm.extract_topology(seg2.ravel(), shape_zyx=sdf.shape), conns)
     # z-y-x origin/spacing: the pore lands at origin + voxel*spacing per axis.
     (p2,), _, _ = pnm.extract_pore_network(sdf, [0.5, 2.0, -1.0], [2.0, 1.0, 0.5])
     assert abs(p2.x - (-1.0 + 8 * 0.5)) < 1e-5 and abs(p2.y - (2.0 + 8)) < 1e-5, p2
@@ -57,14 +63,12 @@ def check_two_spheres():
     d2 = R - np.sqrt((x - 16) ** 2 + (y - 8) ** 2 + (z - 8) ** 2)
     sdf = np.maximum(d1, d2).astype(np.float32)
     pores, seg, conns = pnm.extract_pore_network(sdf, [0.0] * 3, [1.0] * 3)
-    seg = np.asarray(seg)
     assert len(pores) == 2, pores
     assert sorted((p.x, p.y, p.z) for p in pores) == [(8.0, 8.0, 8.0), (16.0, 8.0, 8.0)], pores
-    assert list(conns) == [(-1, 1), (-1, 2), (1, 2)], conns
-    assert throats(conns) == [(1, 2)]
+    assert conns.tolist() == [[-1, 1], [-1, 2], [1, 2]], conns
+    assert throats(conns) == [[1, 2]]
     assert seg.max() == 2 and seg.min() == -1 and not (seg == 0).any()
-    assert seg.shape == (sdf.size,) and seg.reshape(sdf.shape)[8, 8, 8] == 1
-    assert seg.reshape(sdf.shape)[8, 8, 16] == 2
+    assert seg.shape == sdf.shape and seg[8, 8, 8] == 1 and seg[8, 8, 16] == 2  # (Nz,Ny,Nx)
     print("two_spheres: 2 pores, 1 throat, 3 connections  ok")
 
 
@@ -84,7 +88,6 @@ def check_sphere_lattice():
                 dz = np.minimum(dz, gd[2] - dz)
                 sdf = np.minimum(sdf, (np.sqrt(dx * dx + dy * dy + dz * dz) - R).astype(np.float32))
     pores, seg, conns = pnm.extract_pore_network(sdf, [0.0] * 3, [1.0] * 3)
-    seg = np.asarray(seg)
     assert len(pores) == 8, len(pores)
     centres = sorted((round(p.x), round(p.y), round(p.z)) for p in pores)
     assert centres == [(px, py, pz) for px in (0, 18) for py in (0, 15) for pz in (0, 12)], centres

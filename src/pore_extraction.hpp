@@ -193,14 +193,22 @@ inline std::vector<std::pair<int, int>> extractTopologyView(const Kokkos::View<i
   return kernels::uniquePairs(pairs, static_cast<std::size_t>(h_count));  // only the used slots
 }
 
-// Host wrapper: upload the segmentation, then run the device core.
+// Host wrapper: upload the segmentation from a caller-owned buffer (the binding hands over the
+// NumPy array's memory directly), then run the device core.
+inline std::vector<std::pair<int, int>> extract_topology_k(const int* seg_h, std::size_t n,
+                                                           std::array<int, 3> resolution) {
+  if (n == 0)
+    return {};
+  Kokkos::View<int*, Mem> seg("seg", n);
+  Kokkos::deep_copy(
+      seg, Kokkos::View<const int*, Kokkos::HostSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
+               seg_h, n));
+  return extractTopologyView(seg, resolution);
+}
+
 inline std::vector<std::pair<int, int>> extract_topology_k(const std::vector<int>& seg_h,
                                                            std::array<int, 3> resolution) {
-  if (seg_h.empty())
-    return {};
-  Kokkos::View<int*, Mem> seg("seg", seg_h.size());
-  uploadVec(seg_h, seg);
-  return extractTopologyView(seg, resolution);
+  return extract_topology_k(seg_h.data(), seg_h.size(), resolution);
 }
 
 // ---- network flow: throat flow rates + pore-center pressures from a MAC flow field ----
