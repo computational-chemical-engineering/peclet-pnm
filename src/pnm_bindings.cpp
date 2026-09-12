@@ -168,7 +168,10 @@ NB_MODULE(_pnm, m) {
   peclet::core::python::install(m);
 
   // VTI reader (pure C++; sdf_reader.cpp). Returns (sdf_3d[nz,ny,nx], origin_zyx, spacing_zyx).
-  nb::class_<SDFReader>(m, "SDFReader")
+  nb::class_<SDFReader>(m, "SDFReader",
+                        "VTI (VTK ImageData) reader for a signed-distance-field volume. Stateless: "
+                        "the class exists only to hold read_vti as a static method, not to be "
+                        "instantiated — call SDFReader.read_vti(filename) directly.")
       .def_static(
           "read_vti",
           [](const std::string& filename) {
