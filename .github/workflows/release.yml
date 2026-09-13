@@ -31,10 +31,11 @@ jobs:
           path: dist/*.tar.gz
 
   # Every platform peclet has been SHOWN to build on (2026-09-13 wheel probe; suite
-  # docs/RELEASE_PREP.md section 11.2). Linux gets the OpenMP host backend, Windows and macOS get
-  # Serial, and the build decides that itself -- cmake/PecletDeps.cmake asks find_package for
-  # OpenMP 3.0 and falls back, because AppleClang ships no OpenMP and MSVC reports 2.0 whatever
-  # runtime is selected. `execution_space` on the installed module reports which one you got.
+  # docs/RELEASE_PREP.md sections 11.2 and 11.3). All four are multi-threaded: Linux gets the OpenMP
+  # host backend, Windows and macOS get Kokkos' C++ threads backend, and the build decides that
+  # itself -- cmake/PecletDeps.cmake asks find_package for OpenMP 3.0 and falls back, because
+  # AppleClang ships no OpenMP and MSVC reports 2.0 whatever runtime is selected. Same numbers from
+  # all three; `execution_space` on the installed module reports which one you got.
   #
   # Not here, and why:
   #   macOS x86-64  GitHub has retired the Intel runners -- a macos-13 job now queues forever -- so
@@ -54,9 +55,9 @@ jobs:
           - os: ubuntu-24.04-arm
             label: manylinux aarch64 (OpenMP)
           - os: windows-latest
-            label: win_amd64 (Serial)
+            label: win_amd64 (Threads)
           - os: macos-latest
-            label: macOS arm64 (Serial)
+            label: macOS arm64 (Threads)
     steps:
       - uses: actions/checkout@v7
       # cibuildwheel reads [tool.cibuildwheel] from pyproject.toml (PECLET_VENDOR_DEPS=ON): each wheel
