@@ -81,7 +81,13 @@ function(_peclet_stage_build name url tag)  # extra -D configure args via ARGN
   if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "[peclet] ${name} configure failed (${_rc})")
   endif()
-  execute_process(COMMAND ${CMAKE_COMMAND} --build "${${name}_BINARY_DIR}" --target install --parallel
+  # --config Release matters on a MULTI-CONFIG generator (Visual Studio), where CMAKE_BUILD_TYPE
+  # above is ignored and `--build --target install` otherwise installs the DEBUG build. Linking that
+  # into a Release extension is LNK2038, "RuntimeLibrary MDd_DynamicDebug doesn't match
+  # MD_DynamicRelease" -- measured on the 2026-09-13 Windows wheel probe. Single-config generators
+  # ignore the flag.
+  execute_process(COMMAND ${CMAKE_COMMAND} --build "${${name}_BINARY_DIR}" --config Release
+                          --target install --parallel
                   RESULT_VARIABLE _rc)
   if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "[peclet] ${name} build/install failed (${_rc})")
