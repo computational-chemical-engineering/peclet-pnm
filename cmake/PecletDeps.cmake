@@ -103,9 +103,22 @@ macro(peclet_require_kokkos)
   if(Kokkos_FOUND)
     message(STATUS "[peclet] Kokkos ${Kokkos_VERSION} from prefix (${Kokkos_DEVICES})")
   else()
-    message(STATUS "[peclet] vendored Kokkos extra args: ${PECLET_VENDOR_KOKKOS_ARGS}")
+    # Host backend: OpenMP when this toolchain HAS a usable one, Serial when it does not, rather
+    # than a hard -DKokkos_ENABLE_OPENMP=ON that simply fails the build off Linux. Kokkos requires
+    # OpenMP >= 3.0, and two mainstream toolchains cannot give it (measured, 2026-09-13 wheel probe):
+    # AppleClang ships no OpenMP at all, and MSVC reports 2.0 whatever runtime you pick, because it
+    # defines _OPENMP as 200203 even under /openmp:llvm. A Serial wheel still runs, and
+    # `execution_space` reports "Serial" so nobody is misled about what they got.
+    find_package(OpenMP 3.0 QUIET COMPONENTS CXX)
+    if(OpenMP_CXX_FOUND)
+      set(_peclet_kokkos_omp ON)
+    else()
+      set(_peclet_kokkos_omp OFF)
+      message(STATUS "[peclet] no OpenMP >= 3.0 for ${CMAKE_CXX_COMPILER_ID}; vendoring Kokkos Serial-only")
+    endif()
+    message(STATUS "[peclet] vendored Kokkos: OPENMP=${_peclet_kokkos_omp} SERIAL=ON ${PECLET_VENDOR_KOKKOS_ARGS}")
     _peclet_stage_build(kokkos "https://github.com/kokkos/kokkos.git" "${PECLET_KOKKOS_TAG}"
-                        -DKokkos_ENABLE_OPENMP=ON -DKokkos_ENABLE_SERIAL=ON
+                        -DKokkos_ENABLE_OPENMP=${_peclet_kokkos_omp} -DKokkos_ENABLE_SERIAL=ON
                         ${PECLET_VENDOR_KOKKOS_ARGS})
     list(APPEND CMAKE_PREFIX_PATH "${PECLET_STAGE_PREFIX}")
     find_package(Kokkos CONFIG REQUIRED)

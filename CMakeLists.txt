@@ -1,23 +1,24 @@
 cmake_minimum_required(VERSION 3.24)
 
 # -- Supported platform -------------------------------------------------------------------------
-# peclet is a Linux x86-64 project. The published wheels are manylinux_2_28 (the vendored Kokkos
-# build wants GCC 12+ for C++20) and nothing here is built or tested for Windows or macOS. pip falls
-# back to the SOURCE distribution whenever no wheel matches the platform, so `pip install peclet-pnm`
-# on Windows lands in this file and dies inside project() with "No CMAKE_CXX_COMPILER could be
-# found" -- a message about a missing compiler, when the real answer is "not this operating system".
-# Say the real answer, before project() gets the chance to say the wrong one.
-# (A Windows user met the CMake message on 2026-09-13; suite/docs/RELEASE_PREP.md section 11.)
+# Wheels exist for Linux (x86-64 and aarch64), Windows x64 and macOS arm64; anywhere else pip falls
+# back to THIS source distribution, and the build dies inside project() with "No CMAKE_CXX_COMPILER
+# could be found" -- a message about a missing compiler when the real answer is usually "not this
+# operating system". Say the real answer first. A source build on a supported platform is fine and
+# is exactly what the sdist is for; it is the unknown ones that get stopped here.
+# (History: a Windows user met the CMake message on 2026-09-13; the wheel probe that followed showed
+#  Windows and macOS build cleanly, so they became supported rather than rejected. Linux keeps the
+#  OpenMP host backend; Windows and macOS get Serial, because AppleClang ships no OpenMP and MSVC
+#  reports 2.0 whatever runtime is selected. suite/docs/RELEASE_PREP.md section 11.1.)
 cmake_host_system_information(RESULT PECLET_HOST_OS QUERY OS_NAME)
-if(NOT PECLET_HOST_OS STREQUAL "Linux" AND NOT PECLET_ALLOW_UNSUPPORTED_PLATFORM)
+if(NOT PECLET_HOST_OS MATCHES "^(Linux|Windows|macOS|Darwin)$" AND NOT PECLET_ALLOW_UNSUPPORTED_PLATFORM)
   message(FATAL_ERROR
-    "peclet-pnm is built and tested on Linux x86-64 only, and this host is ${PECLET_HOST_OS}.\n"
-    "  Windows: install inside WSL2 -- `wsl --install`, then pip install in the Linux shell.\n"
-    "  macOS:   use a Linux container (see suite docs/DEPLOYMENT.md).\n"
-    "  Neither: run the quick start in a browser, no install at all --\n"
-    "    https://colab.research.google.com/github/computational-chemical-engineering/peclet/blob/main/docs/notebooks/quickstart_sphere.ipynb\n"
-    "  To attempt a build here regardless (untested, unsupported), configure with\n"
-    "  -DPECLET_ALLOW_UNSUPPORTED_PLATFORM=ON.")
+    "peclet-pnm is built and tested on Linux, Windows and macOS; this host reports ${PECLET_HOST_OS}.\n"
+    "  Nothing here is known to be wrong with your platform -- it has simply never been tried.\n"
+    "  To try it anyway, configure with -DPECLET_ALLOW_UNSUPPORTED_PLATFORM=ON and tell us how it\n"
+    "  went: https://github.com/computational-chemical-engineering/peclet/issues\n"
+    "  To run peclet right now with no install at all, open the quick start in a browser --\n"
+    "    https://colab.research.google.com/github/computational-chemical-engineering/peclet/blob/main/docs/notebooks/quickstart_sphere.ipynb")
 endif()
 
 # One version source: pyproject.toml (`version = "x.y.z"`). packaging/pyproject-cuda.toml,
