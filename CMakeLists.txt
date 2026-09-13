@@ -30,6 +30,14 @@ if(NOT PECLET_PNM_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+")
 endif()
 project(peclet_pnm VERSION ${PECLET_PNM_VERSION} LANGUAGES CXX)
 
+
+# MSVC: the templated Kokkos translation units blow past the COFF section limit -- measured on the
+# 2026-09-13 wheel probe, flow_solver_colocated.cpp raised "C1128: number of sections exceeded
+# object file format limit". /bigobj raises it; there is no downside and no other compiler needs it.
+if(MSVC)
+  add_compile_options(/bigobj)
+endif()
+
 # peclet.pnm — pore-network extraction from SDF geometry (Kokkos GPU compute + the pure-C++ SDFReader
 # VTI reader), as an importable Python module. Split out of peclet-flow (2026-07): the CFD solve lives
 # in peclet.flow; this package is the "pnm_from_sdf" extraction feature on its own.
