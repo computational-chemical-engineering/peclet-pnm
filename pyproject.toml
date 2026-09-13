@@ -59,8 +59,11 @@ sdist.include = ["src", "packaging", "cmake", "CMakeLists.txt", "README.md", "LI
 # Linux-only: the Kokkos build needs a recent toolchain (manylinux_2_28 = GCC 12+, for C++20).
 # ---------------------------------------------------------------------------
 [tool.cibuildwheel]
-build = "cp310-* cp311-* cp312-* cp313-*"
-skip = "*-musllinux* *_i686 pp*"
+# cp314 verified green for all five packages on the 2026-09-13 wheel probe. Without it a user on a
+# current Python falls through to a source build on every platform, Linux included -- the same trap
+# a missing OS wheel is.
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux* *_i686 *-win32 pp*"
 build-frontend = "build"
 manylinux-x86_64-image = "manylinux_2_28"
 # Real smoke: one spherical pore (SDF > 0 inside, peak at the integer center voxel) must extract as

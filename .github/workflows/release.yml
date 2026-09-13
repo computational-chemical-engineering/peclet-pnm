@@ -30,17 +30,41 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
+  # Every platform peclet has been SHOWN to build on (2026-09-13 wheel probe; suite
+  # docs/RELEASE_PREP.md section 11.2). Linux gets the OpenMP host backend, Windows and macOS get
+  # Serial, and the build decides that itself -- cmake/PecletDeps.cmake asks find_package for
+  # OpenMP 3.0 and falls back, because AppleClang ships no OpenMP and MSVC reports 2.0 whatever
+  # runtime is selected. `execution_space` on the installed module reports which one you got.
+  #
+  # Not here, and why:
+  #   macOS x86-64  GitHub has retired the Intel runners -- a macos-13 job now queues forever -- so
+  #                 this could only be cross-compiled and never tested. Intel Macs build from the
+  #                 sdist, which the same probe showed works.
+  #   musllinux     never tried; Alpine is not a peclet audience yet.
+  #   win_arm64     no runner, nobody asking.
   wheels:
-    name: wheels (manylinux_2_28 x86_64)
-    runs-on: ubuntu-latest
+    name: wheels · ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: manylinux x86_64 (OpenMP)
+          - os: ubuntu-24.04-arm
+            label: manylinux aarch64 (OpenMP)
+          - os: windows-latest
+            label: win_amd64 (Serial)
+          - os: macos-latest
+            label: macOS arm64 (Serial)
     steps:
       - uses: actions/checkout@v7
       # cibuildwheel reads [tool.cibuildwheel] from pyproject.toml (PECLET_VENDOR_DEPS=ON): each wheel
       # compiles Kokkos as a subproject, so builds are slow but self-contained.
-      - uses: pypa/cibuildwheel@v2.21
+      - uses: pypa/cibuildwheel@v4.1
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux
+          name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
 
   # peclet-pnm-cu13: single-GPU CUDA wheels. Runs in a manylinux_2_28 container (so the output is a
