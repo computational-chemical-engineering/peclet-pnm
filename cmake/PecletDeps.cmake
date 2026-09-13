@@ -27,6 +27,14 @@ option(PECLET_VENDOR_DEPS "Force FetchContent-build of Kokkos/ArborX/siblings (s
 # /openmp is OpenMP 2.0 and Kokkos requires 3.0; a platform with no usable OpenMP at all takes
 # -DKokkos_ENABLE_OPENMP=OFF and gets a Serial wheel (the later -D wins over the default below).
 set(PECLET_VENDOR_KOKKOS_ARGS "" CACHE STRING "Extra -D flags for the vendored Kokkos configure")
+# ...and from the ENVIRONMENT, which is how a wheel build actually reaches in: cibuildwheel sets
+# environment variables, and nesting one -D inside another (CMAKE_ARGS="-DA=ON -DB=-DC=x") did not
+# survive the trip on Windows -- the whole string arrived as a single argument, so B was never set
+# and only A got a (nonsense, truthy) value. One variable, one job.
+if(NOT PECLET_VENDOR_KOKKOS_ARGS AND DEFINED ENV{PECLET_VENDOR_KOKKOS_ARGS})
+  set(PECLET_VENDOR_KOKKOS_ARGS "$ENV{PECLET_VENDOR_KOKKOS_ARGS}")
+endif()
+separate_arguments(PECLET_VENDOR_KOKKOS_ARGS NATIVE_COMMAND "${PECLET_VENDOR_KOKKOS_ARGS}")
 
 # nanobind — found via the active interpreter (scikit-build-core supplies it as a build requirement),
 # identical to the umbrella SuiteNanobind helper but vendored so an isolated sdist build needs no ../cmake.
@@ -89,6 +97,7 @@ macro(peclet_require_kokkos)
   if(Kokkos_FOUND)
     message(STATUS "[peclet] Kokkos ${Kokkos_VERSION} from prefix (${Kokkos_DEVICES})")
   else()
+    message(STATUS "[peclet] vendored Kokkos extra args: ${PECLET_VENDOR_KOKKOS_ARGS}")
     _peclet_stage_build(kokkos "https://github.com/kokkos/kokkos.git" "${PECLET_KOKKOS_TAG}"
                         -DKokkos_ENABLE_OPENMP=ON -DKokkos_ENABLE_SERIAL=ON
                         ${PECLET_VENDOR_KOKKOS_ARGS})
