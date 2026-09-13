@@ -103,22 +103,35 @@ macro(peclet_require_kokkos)
   if(Kokkos_FOUND)
     message(STATUS "[peclet] Kokkos ${Kokkos_VERSION} from prefix (${Kokkos_DEVICES})")
   else()
-    # Host backend: OpenMP when this toolchain HAS a usable one, Serial when it does not, rather
-    # than a hard -DKokkos_ENABLE_OPENMP=ON that simply fails the build off Linux. Kokkos requires
-    # OpenMP >= 3.0, and two mainstream toolchains cannot give it (measured, 2026-09-13 wheel probe):
-    # AppleClang ships no OpenMP at all, and MSVC reports 2.0 whatever runtime you pick, because it
-    # defines _OPENMP as 200203 even under /openmp:llvm. A Serial wheel still runs, and
-    # `execution_space` reports "Serial" so nobody is misled about what they got.
+    # Host-parallel backend: OpenMP where the toolchain HAS one, the C++ std::thread backend where
+    # it does not -- never a hard -DKokkos_ENABLE_OPENMP=ON, which simply fails the build off Linux.
+    # Kokkos requires OpenMP >= 3.0 and two mainstream toolchains cannot give it (measured,
+    # 2026-09-13 wheel probe): AppleClang ships no OpenMP at all, and MSVC reports 2.0 whatever
+    # runtime is selected, because it defines _OPENMP as 200203 even under /openmp:llvm -- the gate
+    # is a macro version, not a capability.
+    #
+    # Kokkos::Threads needs no OpenMP runtime, so it costs no vendored libomp (Homebrew publishes
+    # only a tahoe bottle, which would drag the macOS wheel floor from 11 to 26) and no asserted
+    # version the build system cannot check. The suite is indifferent to which one it gets: exactly
+    # one line in eight repositories names Kokkos::OpenMP, and it is #ifdef-guarded.
+    #
+    # Both are multi-threaded. `execution_space` on the installed module reports which you have, and
+    # peclet::core::cpuBudget sizes the pool the same way for either.
     find_package(OpenMP 3.0 QUIET COMPONENTS CXX)
     if(OpenMP_CXX_FOUND)
       set(_peclet_kokkos_omp ON)
+      set(_peclet_kokkos_thr OFF)
     else()
       set(_peclet_kokkos_omp OFF)
-      message(STATUS "[peclet] no OpenMP >= 3.0 for ${CMAKE_CXX_COMPILER_ID}; vendoring Kokkos Serial-only")
+      set(_peclet_kokkos_thr ON)
+      message(STATUS "[peclet] no OpenMP >= 3.0 for ${CMAKE_CXX_COMPILER_ID}; "
+                     "vendoring Kokkos with the C++ threads backend instead")
     endif()
-    message(STATUS "[peclet] vendored Kokkos: OPENMP=${_peclet_kokkos_omp} SERIAL=ON ${PECLET_VENDOR_KOKKOS_ARGS}")
+    message(STATUS "[peclet] vendored Kokkos: OPENMP=${_peclet_kokkos_omp} THREADS=${_peclet_kokkos_thr} "
+                   "SERIAL=ON ${PECLET_VENDOR_KOKKOS_ARGS}")
     _peclet_stage_build(kokkos "https://github.com/kokkos/kokkos.git" "${PECLET_KOKKOS_TAG}"
-                        -DKokkos_ENABLE_OPENMP=${_peclet_kokkos_omp} -DKokkos_ENABLE_SERIAL=ON
+                        -DKokkos_ENABLE_OPENMP=${_peclet_kokkos_omp}
+                        -DKokkos_ENABLE_THREADS=${_peclet_kokkos_thr} -DKokkos_ENABLE_SERIAL=ON
                         ${PECLET_VENDOR_KOKKOS_ARGS})
     list(APPEND CMAKE_PREFIX_PATH "${PECLET_STAGE_PREFIX}")
     find_package(Kokkos CONFIG REQUIRED)
