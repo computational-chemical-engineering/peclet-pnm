@@ -18,6 +18,7 @@ on:
 jobs:
   sdist:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -46,6 +47,7 @@ jobs:
   wheels:
     name: wheels · ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -69,13 +71,32 @@ jobs:
           path: wheelhouse/*.whl
 
   # peclet-pnm-cu13: single-GPU CUDA wheels. Runs in a manylinux_2_28 container (so the output is a
-  # PyPI-uploadable manylinux wheel), installs the CUDA toolkit, builds a Kokkos-CUDA prefix ONCE, then
-  # builds + repairs the pnm wheel for each supported CPython. libcudart is NOT bundled — it is supplied
-  # by the `nvidia-cuda-runtime` runtime wheel (declared in packaging/pyproject-cuda.toml) and reached via
-  # the module rpath baked by -DPECLET_CUDA_RUNTIME_WHEEL=ON. Mirrors peclet-flow's cuda-wheel job.
+  # PyPI-uploadable manylinux wheel), installs the CUDA toolkit, builds a Kokkos-CUDA prefix, then
+  # builds + repairs the pnm wheel for ONE CPython (one job per interpreter, see below). libcudart is
+  # NOT bundled — it is supplied by the `nvidia-cuda-runtime` runtime wheel (declared in
+  # packaging/pyproject-cuda.toml) and reached via the module rpath baked by
+  # -DPECLET_CUDA_RUNTIME_WHEEL=ON. Mirrors peclet-flow's cuda-wheel job.
+  # One job PER INTERPRETER, not one job looping over them. voro's serial loop walked into GitHub's
+  # hard 6-hour job cap on 2026-09-14 and took `publish` down with it, publishing nothing for a tag
+  # that had already moved (suite docs/RELEASE_PREP.md 11.5). peclet-pnm is nowhere near that cap -- its
+  # 1.0.1 run (34788223729) spent 4 m 54 s on four wheels, ~1 m 14 s each, after 4 m 04 s of container +
+  # CUDA toolkit + Kokkos setup -- but the fan-out is the better shape regardless, and the family
+  # is worth keeping identical here: the divergence between these four files is itself what let the
+  # cu13 wheels sit a whole interpreter behind the CPU ones. At five interpreters the serial loop is
+  # ~10 min; fanned out it is ~5 min, at the cost of repeating that setup per job.
+  #
+  # cp310 THROUGH cp314, matching [tool.cibuildwheel] `build` in pyproject.toml. The CPU wheels gained
+  # cp314 on 2026-09-13 and this list did not, so 1.0.1 shipped a CPU wheel to a Python 3.14 user and
+  # left their `pip install peclet-pnm-cu13` to a source build it cannot do. The two lists are one
+  # decision and must move together.
   cuda-wheel:
-    name: cuda wheels (peclet-pnm-cu13, manylinux_2_28 x86_64)
+    name: cuda wheel (peclet-pnm-cu13, ${{ matrix.py }}, manylinux_2_28 x86_64)
     runs-on: ubuntu-latest
+    timeout-minutes: 60          # ~5 min expected; fail as a budget, not as a silent 6 h kill
+    strategy:
+      fail-fast: false
+      matrix:
+        py: [cp310-cp310, cp311-cp311, cp312-cp312, cp313-cp313, cp314-cp314]
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
     env:
@@ -116,15 +137,13 @@ jobs:
             "-DKokkos_ARCH_${KOKKOS_ARCH}=ON" -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"
           cmake --build /tmp/kokkos/build --target install -j
 
-      - name: Build + repair CUDA wheels (cp310–cp313)
+      - name: Build + repair the CUDA wheel for ${{ matrix.py }}
         run: |
           export PATH="${CUDA_HOME}/bin:$PATH"
           export CMAKE_PREFIX_PATH="${GITHUB_WORKSPACE}/kokkos-cuda"
           cp packaging/pyproject-cuda.toml pyproject.toml   # -> peclet-pnm-cu13 + nvidia-cuda-runtime dep
           mkdir -p /tmp/raw /tmp/out
-          for PY in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313; do
-            "/opt/python/${PY}/bin/pip" wheel . --no-deps -w /tmp/raw
-          done
+          "/opt/python/${{ matrix.py }}/bin/pip" wheel . --no-deps -w /tmp/raw
           # Retag to manylinux (libcudart/libcuda are external: excluded), then re-add the nvidia rpath
           # auditwheel resets, so `import peclet.pnm` finds libcudart in the nvidia-cuda-runtime wheel.
           /opt/python/cp312-cp312/bin/pip install -q auditwheel wheel
@@ -143,12 +162,13 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-cuda
+          name: wheels-cuda-${{ matrix.py }}
           path: /tmp/out/*.whl
 
   publish:
     needs: [sdist, wheels, cuda-wheel]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     environment: pypi
     permissions:
