@@ -41,7 +41,7 @@ s = peclet.flow.Solver(NX, NY, NZ)
 s.set_rho(1.0)
 s.set_mu(MU)
 s.set_dt(100.0)
-s.set_body_force(FX, 0.0, 0.0)
+s.set_body_force((FX, 0.0, 0.0))   # one 3-sequence since 1.0.0 (the clean break)
 s.set_solid(np.asfortranarray(sdf), cutcell_pressure=True)  # openness-weighted flux o*u*A
 for _ in range(60):
     s.step()
@@ -112,7 +112,7 @@ for (cy, cz, rt) in ((12.0, 12.0, 3.0), (12.0, 36.0, 4.0), (36.0, 12.0, 5.0), (3
     sdf2 = np.maximum(sdf2, rt - np.sqrt((y - cy) ** 2 + (z - cz) ** 2))
 s = peclet.flow.Solver(NX2, NY2, NZ2)
 s.set_rho(1.0); s.set_mu(MU); s.set_dt(100.0)
-s.set_body_force(FX, 0.0, 0.0)
+s.set_body_force((FX, 0.0, 0.0))   # one 3-sequence since 1.0.0 (the clean break)
 s.set_solid(np.asfortranarray(sdf2), cutcell_pressure=True)
 for _ in range(60):
     s.step()
@@ -147,7 +147,7 @@ print("\n=== case 3: chamber-tube chain, ghost-cell IBM ===")
 del s
 s = peclet.flow.Solver(NX, NY, NZ)
 s.set_rho(1.0); s.set_mu(MU); s.set_dt(100.0)
-s.set_body_force(FX, 0.0, 0.0)
+s.set_body_force((FX, 0.0, 0.0))   # one 3-sequence since 1.0.0 (the clean break)
 s.set_ghost_projection(True)
 s.set_solid(np.asfortranarray(sdf), cutcell_pressure=True)
 for _ in range(60):
@@ -210,7 +210,7 @@ sdf4 = np.maximum(sdf4, 4.0 - np.sqrt((xw - xs) ** 2 + (y - 16.0) ** 2 + (z - 16
 
 s = peclet.flow.Solver(NX4, NY4, NZ4)
 s.set_rho(1.0); s.set_mu(MU); s.set_dt(100.0)
-s.set_body_force(FX, 0.0, 0.0)
+s.set_body_force((FX, 0.0, 0.0))   # one 3-sequence since 1.0.0 (the clean break)
 s.set_solid(np.asfortranarray(sdf4), cutcell_pressure=True)
 for _ in range(60):
     s.step()

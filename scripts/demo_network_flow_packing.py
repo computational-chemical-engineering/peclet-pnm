@@ -27,7 +27,7 @@ s = peclet.flow.Solver(nx, ny, nz)
 s.set_rho(1.0)
 s.set_mu(MU)
 s.set_dt(100.0)
-s.set_body_force(FX, 0.0, 0.0)
+s.set_body_force((FX, 0.0, 0.0))   # one 3-sequence since 1.0.0 (the clean break)
 s.set_solid(sdf_xyz, cutcell_pressure=True)
 t0 = time.time()
 for _ in range(40):
