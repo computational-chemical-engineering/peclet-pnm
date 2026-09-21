@@ -2,6 +2,15 @@
 
 **`peclet.pnm` — GPU pore-network extraction from SDF geometry.**
 
+```bash
+pip install peclet-pnm          # CPU (OpenMP) wheels — or `pip install peclet` for the whole family
+pip install peclet-pnm-cu13     # the CUDA 13 build of the same module, in its OWN venv
+```
+
+Both provide the **same import**, `peclet.pnm`, so they are mutually exclusive in one environment —
+one venv per backend. Multi-GPU/MPI and AMD/HIP are source or container builds: see
+[Install & run](https://computational-chemical-engineering.github.io/peclet/DEPLOYMENT/).
+
 Given a signed-distance-field (SDF) description of a porous solid (negative inside the solid,
 positive in the pore space), `peclet.pnm` extracts the pore network:
 
