@@ -153,6 +153,7 @@ pores, seg, conns = pnm.extract_pore_network_mpi(local, global_shape_zyx, origin
 # label ids); conns: global (M,2), identical on every rank. origin_zyx stays the GLOBAL grid's
 # physical origin — mpi_block's offset_zyx is an integer voxel offset, a different thing.
 # Rank and size come from mpi4py (MPI.COMM_WORLD.rank / .size); the module has no mpi_rank().
+# <!-- landing-ok: names the removed spelling on purpose, to say it is absent -->
 ```
 
 Validated by `tests/kokkos_mpi` (ctest, np = 1, 2, 4, OpenMP + CUDA): per-voxel segmentation ids,
