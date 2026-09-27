@@ -15,7 +15,7 @@ authors:
     orcid: "https://orcid.org/0000-0001-6099-3583"
     email: e.a.j.f.peters@tue.nl
     affiliation: "Eindhoven University of Technology"
-version: 1.0.2
-date-released: 2026-09-16
+version: 1.0.3
+date-released: 2026-09-27
 license: MIT
 repository-code: "https://github.com/computational-chemical-engineering/peclet-pnm"
