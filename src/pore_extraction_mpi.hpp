@@ -631,8 +631,8 @@ inline MpiPoreNetwork extract_pore_network_mpi(const std::vector<float>& sdf_loc
 // labels, then re-stages the fields on a g=1 extended block and resolves the FLOW-BASIN label of
 // every cell by propagating the label itself with the same hold-at-ghost finalization scheme as
 // the pore roots (finalized = -label stored, pending = an in-block gid): no remote root-to-label
-// lookup ever needed. Fluxes/areas/centroids/residuals accumulate rank-locally over owned +faces
-// and are Allreduce-summed; the pore list (with trilinearly interpolated pressures, needing a
+// lookup ever needed. Fluxes/areas/centroids/residuals (and the momentum/energy extension and
+// per-pore volume sums) accumulate rank-locally over owned +faces / cells and are Allreduce-summed; the pore list (with trilinearly interpolated pressures, needing a
 // g=2 halo of p around each owned peak) is allgathered. EVERY rank returns the identical global
 // network. Bit-exact to the single-rank extract_network_flow_k up to float-sum ordering
 // (atomics) and the CUDA FMA-contraction wobble on pore centroids.
@@ -767,9 +767,13 @@ inline NetworkFlow extract_network_flow_mpi(
   out.pores.resize(np);
   out.pore_pressure.assign(np, 0.0);
   std::vector<double> ancX(np), ancY(np), ancZ(np);  // peak-voxel min-image anchors
+  std::vector<int> pkx(np), pky(np), pkz(np);        // ... and their integer global coords
   for (const auto& r0 : allRecs) {
     out.pores[r0.id - 1] = r0.po;
     out.pore_pressure[r0.id - 1] = r0.press;
+    pkx[r0.id - 1] = r0.pgx;
+    pky[r0.id - 1] = r0.pgy;
+    pkz[r0.id - 1] = r0.pgz;
     ancX[r0.id - 1] = origin[0] + r0.pgx * double(spacing[0]);
     ancY[r0.id - 1] = origin[1] + r0.pgy * double(spacing[1]);
     ancZ[r0.id - 1] = origin[2] + r0.pgz * double(spacing[2]);
@@ -945,12 +949,25 @@ inline NetworkFlow extract_network_flow_mpi(
 
   // 6. rank-local accumulation over owned +faces, then a global sum-reduce
   std::vector<double> Qh(nt, 0.0), Ah(nt, 0.0), Cxh(nt, 0.0), Cyh(nt, 0.0), Czh(nt, 0.0),
-      Rh(np, 0.0);
+      Rh(np, 0.0), Eh(kn::kThroatExt * nt, 0.0), Vh(std::size_t(kn::kPoreVol) * np, 0.0);
   {
     View<double> Q("pnm::nfmpi::Q", nt), A("pnm::nfmpi::A", nt), Cx("pnm::nfmpi::Cx", nt),
-        Cy("pnm::nfmpi::Cy", nt), Cz("pnm::nfmpi::Cz", nt), resid("pnm::nfmpi::res", np);
+        Cy("pnm::nfmpi::Cy", nt), Cz("pnm::nfmpi::Cz", nt), resid("pnm::nfmpi::res", np),
+        ext("pnm::nfmpi::ext", kn::kThroatExt * nt);
     kn::throatFlux(space, geo, flowLab, uE, vE, wE, oxE, oyE, ozE, hasOpen, faceLab, keyD, slotD,
-                   nt, ancXD, ancYD, ancZD, origin, spacing, gdims, Q, A, Cx, Cy, Cz, resid);
+                   nt, ancXD, ancYD, ancZD, origin, spacing, gdims, Q, A, Cx, Cy, Cz, resid, ext);
+    // per-pore volume sums over the owned fluid cells of each watershed segment (p on g=1: the
+    // kernel reads only owned p; u_c reaches +1, inside the exchanged uE/vE/wE ring)
+    View<double> pE = stageD(p_h, true);
+    View<double> pvol("pnm::nfmpi::pvol", std::size_t(kn::kPoreVol) * np);
+    {
+      Kokkos::View<int*, Mem> pkXD("pnm::nfmpi::pkX", np), pkYD("pnm::nfmpi::pkY", np),
+          pkZD("pnm::nfmpi::pkZ", np);
+      uploadVec(pkx, pkXD);
+      uploadVec(pky, pkYD);
+      uploadVec(pkz, pkZD);
+      kn::poreVolume(space, geo, segE, sdfE, uE, vE, wE, pE, pkXD, pkYD, pkZD, np, gdims, pvol);
+    }
     auto red = [&](const View<double>& d, std::vector<double>& h) {
       auto loc = downloadN(d, h.size());
       MPI_Allreduce(loc.data(), h.data(), int(h.size()), MPI_DOUBLE, MPI_SUM, comm);
@@ -961,6 +978,8 @@ inline NetworkFlow extract_network_flow_mpi(
     red(Cy, Cyh);
     red(Cz, Czh);
     red(resid, Rh);
+    red(ext, Eh);
+    red(pvol, Vh);
   }
   out.throat_flow = Qh;
   out.throat_area = Ah;
@@ -970,6 +989,14 @@ inline NetworkFlow extract_network_flow_mpi(
   out.throat_dp =
       kn::throatPressureDrops(out.throats, out.pores, out.pore_pressure, out.throat_area, Cxh, Cyh,
                               Czh, ancX, ancY, ancZ, spacing, gdims, grad_p);
+
+  // 8. the momentum / volume extension: the same host finishers as single-rank
+  auto ps = kn::poreVolumeStats(Vh, np, spacing, ancX, ancY, ancZ);
+  auto dpMean = kn::throatPressureDrops(out.throats, ps.cx, ps.cy, ps.cz, ps.mean_pressure,
+                                        out.throat_area, Cxh, Cyh, Czh, ancX, ancY, ancZ, spacing,
+                                        gdims, grad_p);
+  auto te = kn::throatExtras(out.throats, Eh, out.throat_area, Cxh, Cyh, Czh, ancX, ancY, ancZ);
+  assignExtras(out, std::move(te), std::move(ps), std::move(dpMean));
   return out;
 }
 

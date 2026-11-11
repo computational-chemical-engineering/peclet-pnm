@@ -887,11 +887,43 @@ inline ThroatSlots throatSlots(std::vector<std::pair<Index, Index>> rootPair) {
   return ts;
 }
 
+/// Number of per-throat momentum/energy sums of throatFlux (`ext`, layout [c*nt + slot]):
+/// c = 0..2 momentum flux x,y,z; 3 kinetic-energy flux; 4..6 open-area-weighted oriented normal
+/// x,y,z.
+constexpr int kThroatExt = 7;
+
+/// Full velocity vector at the centre of the +d face of field cell (lx,ly,lz) (the shared face
+/// with the +d neighbour, where the normal MAC component `un` lives): each tangential component
+/// d2 != d is the plain average of the 4 nearest d2-face values — the -d2 and +d2 faces of the
+/// cell and of its +d neighbour (u(i,j,k) is the -x face of cell (i,j,k)). Unweighted by
+/// openness: a face value is the fluid velocity of its open part. Reaches field offsets up to
+/// +1 along two axes, so a g=1 block suffices.
+template <class Geo, class FieldView>
+KOKKOS_INLINE_FUNCTION void faceVelocity(const Geo& g, const FieldView& u, const FieldView& v,
+                                         const FieldView& w, int lx, int ly, int lz, int d,
+                                         double un, double uf[3]) {
+  for (int d2 = 0; d2 < 3; ++d2) {
+    if (d2 == d) {
+      uf[d2] = un;
+      continue;
+    }
+    const FieldView& f = d2 == 0 ? u : (d2 == 1 ? v : w);
+    const int ex = (d2 == 0), ey = (d2 == 1), ez = (d2 == 2);
+    const int nx = lx + (d == 0), ny = ly + (d == 1), nz = lz + (d == 2);
+    uf[d2] = 0.25 * ((f(g.cell(lx, ly, lz)) + f(g.cell(lx + ex, ly + ey, lz + ez))) +
+                     (f(g.cell(nx, ny, nz)) + f(g.cell(nx + ex, ny + ey, nz + ez))));
+  }
+}
+
 /// Accumulate over every owned +face where the flow-basin label changes: the openness-weighted
 /// MAC flux o·u·A into the per-pore residual (signed) and, for interface faces of a throat patch,
 /// into the throat's flow (positive lower -> higher label), open area and area-weighted centroid
 /// (min-imaged relative to the LOWER pore's peak-voxel anchor `anc{X,Y,Z}` — integer-derived, so
-/// the periodic-image branch is deterministic under FMA wobble).
+/// the periodic-image branch is deterministic under FMA wobble). `ext` (kThroatExt*nt, zeroed)
+/// takes, per throat face of open-area weight w0 = o·A and oriented normal n (+-e_d, lower ->
+/// higher label): the momentum flux w0·u_vec·(u·n), the kinetic-energy flux w0·½|u_vec|²·(u·n)
+/// (u_vec from faceVelocity) and w0·n. Per unit density; Q, A and the centroid sums are
+/// accumulated exactly as before the extension (separate views, same expressions).
 template <class Geo, class LabView, class FieldView, class OpenView, class FaceLabView,
           class KeyView, class SlotView, class AncView, class AccView>
 inline void throatFlux(const Exec& space, const Geo& geo, const LabView& flowLab,
@@ -902,7 +934,7 @@ inline void throatFlux(const Exec& space, const Geo& geo, const LabView& flowLab
                        const AncView& ancZ, std::array<float, 3> origin,
                        std::array<float, 3> spacing, std::array<int, 3> gdims, const AccView& Q,
                        const AccView& A, const AccView& Cx, const AccView& Cy, const AccView& Cz,
-                       const AccView& resid) {
+                       const AccView& resid, const AccView& ext) {
   const Geo g = geo;
   const double Ax = double(spacing[1]) * spacing[2], Ay = double(spacing[0]) * spacing[2],
                Az = double(spacing[0]) * spacing[1];
@@ -955,6 +987,17 @@ inline void throatFlux(const Exec& space, const Geo& geo, const LabView& flowLab
               Kokkos::atomic_add(&Cx(slot), w0 * fp[0]);
               Kokkos::atomic_add(&Cy(slot), w0 * fp[1]);
               Kokkos::atomic_add(&Cz(slot), w0 * fp[2]);
+              // momentum / kinetic-energy flux and the oriented normal (n = s*e_d)
+              const double sgn = a < b ? 1.0 : -1.0;
+              const double un = sgn * vel;  // u·n
+              double uf[3];
+              faceVelocity(g, u, v, w, lx, ly, lz, d, vel, uf);
+              const double wun = w0 * un;
+              for (int a2 = 0; a2 < 3; ++a2)
+                Kokkos::atomic_add(&ext(a2 * ntl + slot), wun * uf[a2]);
+              const double ke = 0.5 * (uf[0] * uf[0] + uf[1] * uf[1] + uf[2] * uf[2]);
+              Kokkos::atomic_add(&ext(3 * ntl + slot), wun * ke);
+              Kokkos::atomic_add(&ext((4 + d) * ntl + slot), w0 * sgn);
             }
           }
         }
@@ -962,13 +1005,140 @@ inline void throatFlux(const Exec& space, const Geo& geo, const LabView& flowLab
   space.fence();
 }
 
+/// Number of per-pore volume sums of poreVolume (layout [c*np + k]): c = 0 fluid cell count;
+/// 1 sum of p; 2 sum of ½|u_c|²; 3..5 sum of u_c x,y,z; 6..8 sum of the integer min-image cell
+/// offset x,y,z from the pore's peak voxel.
+constexpr int kPoreVol = 9;
+
+/// Per-pore volume sums over the owned FLUID cells (sdf > 0) of each watershed segment (`seg`,
+/// labels 1..np). u_c is the cell-centred velocity, the mean of the cell's two MAC faces per
+/// component (reaches field offset +1, g=1 suffices). The centroid offset is integer min-image
+/// arithmetic relative to the pore's peak voxel `pk{X,Y,Z}` (global coords; wrapped to
+/// [-n/2, n/2) per axis), so it — like the count — is an exact integer sum, independent of the
+/// accumulation order. `acc` (kPoreVol*np) must be zeroed.
+template <class Geo, class SegView, class SdfView, class FieldView, class PkView, class AccView>
+inline void poreVolume(const Exec& space, const Geo& geo, const SegView& seg, const SdfView& sdf,
+                       const FieldView& u, const FieldView& v, const FieldView& w,
+                       const FieldView& p, const PkView& pkX, const PkView& pkY,
+                       const PkView& pkZ, int np, std::array<int, 3> gdims, const AccView& acc) {
+  const Geo g = geo;
+  const std::int64_t npl = np;
+  const int gnx = gdims[0], gny = gdims[1], gnz = gdims[2];
+  Kokkos::parallel_for(
+      "pnm::pore_volume", ownedRange(space, g), KOKKOS_LAMBDA(int ix, int iy, int iz) {
+        const int lx = ix + g.g, ly = iy + g.g, lz = iz + g.g;
+        const Index ce = g.cell(lx, ly, lz);
+        const int k = seg(ce) - 1;
+        if (!(sdf(ce) > 0.0f) || k < 0)
+          return;
+        const double uc[3] = {0.5 * (u(ce) + u(g.cell(lx + 1, ly, lz))),
+                              0.5 * (v(ce) + v(g.cell(lx, ly + 1, lz))),
+                              0.5 * (w(ce) + w(g.cell(lx, ly, lz + 1)))};
+        int gx, gy, gz;
+        g.gcoord(lx, ly, lz, gx, gy, gz);
+        const int off[3] = {wrapc(gx - pkX(k) + gnx / 2, gnx) - gnx / 2,
+                            wrapc(gy - pkY(k) + gny / 2, gny) - gny / 2,
+                            wrapc(gz - pkZ(k) + gnz / 2, gnz) - gnz / 2};
+        Kokkos::atomic_add(&acc(k), 1.0);
+        Kokkos::atomic_add(&acc(npl + k), double(p(ce)));
+        Kokkos::atomic_add(&acc(2 * npl + k), 0.5 * (uc[0] * uc[0] + uc[1] * uc[1] + uc[2] * uc[2]));
+        for (int a = 0; a < 3; ++a) {
+          Kokkos::atomic_add(&acc((3 + a) * npl + k), uc[a]);
+          Kokkos::atomic_add(&acc((6 + a) * npl + k), double(off[a]));
+        }
+      });
+  space.fence();
+}
+
+/// Host finish of the per-throat extras (both pipelines), every vector triple in z-y-x order
+/// (3*nt, row t = (z, y, x)) as the binding hands it over: the momentum flux and the
+/// open-area-weighted mean oriented normal Σw0·n / Σw0 (NOT normalised: |n| < 1 on a curved
+/// patch), and the area-weighted centroid in the image frame of the LOWER pore's peak voxel
+/// (anchor + Σw0·offset / Σw0; not wrapped into the box — no float image decision).
+struct ThroatExtras {
+  std::vector<double> momentum_flux_zyx, kinetic_energy_flux, normal_zyx, centroid_zyx;
+};
+inline ThroatExtras throatExtras(const std::vector<std::pair<int, int>>& throats,
+                                 const std::vector<double>& ext,
+                                 const std::vector<double>& throatArea,
+                                 const std::vector<double>& Cx, const std::vector<double>& Cy,
+                                 const std::vector<double>& Cz, const std::vector<double>& ancX,
+                                 const std::vector<double>& ancY,
+                                 const std::vector<double>& ancZ) {
+  const std::size_t nt = throats.size();
+  ThroatExtras te;
+  te.momentum_flux_zyx.resize(3 * nt);
+  te.kinetic_energy_flux.resize(nt);
+  te.normal_zyx.resize(3 * nt);
+  te.centroid_zyx.resize(3 * nt);
+  for (std::size_t t = 0; t < nt; ++t) {
+    const int lo = throats[t].first - 1;
+    const double aw = throatArea[t];
+    const double c[3] = {ancX[lo] + Cx[t] / aw, ancY[lo] + Cy[t] / aw, ancZ[lo] + Cz[t] / aw};
+    for (int a = 0; a < 3; ++a) {  // xyz -> zyx column 2-a
+      te.momentum_flux_zyx[3 * t + 2 - a] = ext[a * nt + t];
+      te.normal_zyx[3 * t + 2 - a] = ext[(4 + a) * nt + t] / aw;
+      te.centroid_zyx[3 * t + 2 - a] = c[a];
+    }
+    te.kinetic_energy_flux[t] = ext[3 * nt + t];
+  }
+  return te;
+}
+
+/// Host finish of the per-pore volume sums (both pipelines): fluid volume (count * cell volume),
+/// volume means of p, ½|u_c|² and u_c (z-y-x), and the volume centroid (peak-voxel anchor + mean
+/// integer offset * spacing, i.e. in the pore's own image frame; z-y-x, plus the x/y/z vectors
+/// the volume-mean pressure drop takes).
+struct PoreVolumeStats {
+  std::vector<double> volume, mean_pressure, mean_kinetic_energy, mean_velocity_zyx,
+      centroid_zyx;
+  std::vector<double> cx, cy, cz;  // the centroid as separate x/y/z vectors
+};
+inline PoreVolumeStats poreVolumeStats(const std::vector<double>& acc, int np,
+                                       std::array<float, 3> spacing,
+                                       const std::vector<double>& ancX,
+                                       const std::vector<double>& ancY,
+                                       const std::vector<double>& ancZ) {
+  const std::size_t n = std::size_t(np);
+  PoreVolumeStats ps;
+  ps.volume.resize(n);
+  ps.mean_pressure.resize(n);
+  ps.mean_kinetic_energy.resize(n);
+  ps.mean_velocity_zyx.resize(3 * n);
+  ps.centroid_zyx.resize(3 * n);
+  ps.cx.resize(n);
+  ps.cy.resize(n);
+  ps.cz.resize(n);
+  const double cellVol = double(spacing[0]) * double(spacing[1]) * double(spacing[2]);
+  for (std::size_t k = 0; k < n; ++k) {
+    const double cnt = acc[k];  // >= 1: the peak voxel itself is fluid
+    ps.volume[k] = cnt * cellVol;
+    ps.mean_pressure[k] = acc[n + k] / cnt;
+    ps.mean_kinetic_energy[k] = acc[2 * n + k] / cnt;
+    const double anc[3] = {ancX[k], ancY[k], ancZ[k]};
+    double c[3];
+    for (int a = 0; a < 3; ++a) {
+      ps.mean_velocity_zyx[3 * k + 2 - a] = acc[(3 + a) * n + k] / cnt;
+      c[a] = anc[a] + (acc[(6 + a) * n + k] / cnt) * double(spacing[a]);
+      ps.centroid_zyx[3 * k + 2 - a] = c[a];
+    }
+    ps.cx[k] = c[0];
+    ps.cy[k] = c[1];
+    ps.cz[k] = c[2];
+  }
+  return ps;
+}
+
 /// Total-pressure drop per throat: periodic parts + the macroscopic gradient along the throat-
 /// anchored two-leg min-image path i -> throat centroid -> j. Every position term cancels except
 /// the integer periodic image count k, decided in SNAPPED integer-cell arithmetic (peak-voxel
 /// anchors + the bias-rounded throat centroid) so float wobble can never flip the image branch.
 /// (A single min-image between the pore centers is ambiguous at exactly half the period.)
+/// Position form: pore k sits at (posX, posY, posZ)[k] — any point in the image frame of its
+/// peak-voxel anchor (the refined pore centre, or the pore's volume centroid).
 inline std::vector<double> throatPressureDrops(
-    const std::vector<std::pair<int, int>>& throats, const std::vector<Pore>& pores,
+    const std::vector<std::pair<int, int>>& throats, const std::vector<double>& posX,
+    const std::vector<double>& posY, const std::vector<double>& posZ,
     const std::vector<double>& porePressure, const std::vector<double>& throatArea,
     const std::vector<double>& Cx, const std::vector<double>& Cy, const std::vector<double>& Cz,
     const std::vector<double>& ancX, const std::vector<double>& ancY,
@@ -980,14 +1150,12 @@ inline std::vector<double> throatPressureDrops(
                        double(gdims[2]) * spacing[2]};
   for (std::size_t t = 0; t < nt; ++t) {
     const int li = throats[t].first, lj = throats[t].second;
-    const Pore& pi = pores[li - 1];
-    const Pore& pj = pores[lj - 1];
     const double aw = throatArea[t];
     const double anc[3] = {ancX[li - 1], ancY[li - 1], ancZ[li - 1]};
     const double ancj[3] = {ancX[lj - 1], ancY[lj - 1], ancZ[lj - 1]};
     double macro = 0.0;
-    const double pip[3] = {double(pi.x), double(pi.y), double(pi.z)};
-    const double pjp[3] = {double(pj.x), double(pj.y), double(pj.z)};
+    const double pip[3] = {posX[li - 1], posY[li - 1], posZ[li - 1]};
+    const double pjp[3] = {posX[lj - 1], posY[lj - 1], posZ[lj - 1]};
     for (int a = 0; a < 3; ++a) {
       const double ct = (Cx[t] * (a == 0) + Cy[t] * (a == 1) + Cz[t] * (a == 2)) / aw;
       const long long Dc = llround((ancj[a] - anc[a]) / double(spacing[a])) -
@@ -998,6 +1166,24 @@ inline std::vector<double> throatPressureDrops(
     dp[t] = (porePressure[li - 1] - porePressure[lj - 1]) - macro;
   }
   return dp;
+}
+
+/// Pore-centre form (the `throat_dp` output): positions = the refined pore centres.
+inline std::vector<double> throatPressureDrops(
+    const std::vector<std::pair<int, int>>& throats, const std::vector<Pore>& pores,
+    const std::vector<double>& porePressure, const std::vector<double>& throatArea,
+    const std::vector<double>& Cx, const std::vector<double>& Cy, const std::vector<double>& Cz,
+    const std::vector<double>& ancX, const std::vector<double>& ancY,
+    const std::vector<double>& ancZ, std::array<float, 3> spacing, std::array<int, 3> gdims,
+    std::array<double, 3> grad_p) {
+  std::vector<double> px(pores.size()), py(pores.size()), pz(pores.size());
+  for (std::size_t k = 0; k < pores.size(); ++k) {
+    px[k] = double(pores[k].x);
+    py[k] = double(pores[k].y);
+    pz[k] = double(pores[k].z);
+  }
+  return throatPressureDrops(throats, px, py, pz, porePressure, throatArea, Cx, Cy, Cz, ancX, ancY,
+                             ancZ, spacing, gdims, grad_p);
 }
 
 }  // namespace kernels

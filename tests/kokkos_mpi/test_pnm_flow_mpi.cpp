@@ -4,8 +4,10 @@
 // flow; the bookkeeping only needs consistency) are extracted (a) via extract_network_flow_mpi
 // distributed over the ORB blocks and (b) via the single-rank extract_network_flow_k on rank 0.
 // The distributed result is global and identical on every rank; it must match the oracle: throat
-// list and pore ids exactly; Q/A/dp/pressures/residuals to accumulation-order tolerance (both
-// paths sum with atomics); pore positions to the CUDA FMA-contraction tolerance. Two configs:
+// list and pore ids exactly; Q/A/dp/pressures/residuals and the momentum/energy/volume-mean
+// extension to accumulation-order tolerance (both paths sum with atomics); pore volumes and
+// volume centroids bitwise (exact integer sums); pore positions to the CUDA FMA-contraction
+// tolerance. Two configs:
 // with openness fields and fully open. np = 1, 2, 4, any Kokkos backend.
 #include <mpi.h>
 
@@ -45,6 +47,28 @@ double fld(int c, int gx, int gy, int gz, std::array<int, 3> gd) {
 
 bool close(double a, double b, double tol) {
   return std::fabs(a - b) <= tol;
+}
+
+// Momentum/volume extension arrays: same length, and every entry within rtol * max|oracle| of the
+// oracle (atomic accumulation order); rtol = 0 demands bitwise equality (the order-independent
+// integer sums: volumes, volume centroids). Prints the measured max deviation.
+bool closeArray(const char* cfg, const char* key, const std::vector<double>& d,
+                const std::vector<double>& o, double rtol) {
+  if (d.size() != o.size()) {
+    std::printf("[%s] FAIL %s: size %zu vs %zu\n", cfg, key, d.size(), o.size());
+    return false;
+  }
+  double scale = 1e-300, dev = 0.0;
+  for (double x : o)
+    scale = std::max(scale, std::fabs(x));
+  bool ok = true;
+  for (std::size_t i = 0; i < o.size(); ++i) {
+    dev = std::max(dev, std::fabs(d[i] - o[i]));
+    ok = ok && (rtol == 0.0 ? d[i] == o[i] : close(d[i], o[i], rtol * scale));
+  }
+  std::printf("[%s] %s %s: n=%zu max|dev|/max|ref| = %.3e%s\n", cfg, ok ? "ok  " : "FAIL", key,
+              o.size(), dev / scale, rtol == 0.0 ? " (bitwise)" : "");
+  return ok;
 }
 
 int runConfig(const char* name, bool withOpen, MPI_Comm comm) {
@@ -132,6 +156,28 @@ int runConfig(const char* name, bool withOpen, MPI_Comm comm) {
           fail = 1;
         }
       }
+    }
+    if (!fail) {
+      // the extension: atomic-order tolerance like Q/A, bitwise for the integer volume sums
+      const double rt = 1e-10;
+      bool ok = closeArray(name, "throat_momentum_flux_zyx", dist.throat_momentum_flux_zyx,
+                           orc.throat_momentum_flux_zyx, rt);
+      ok &= closeArray(name, "throat_kinetic_energy_flux", dist.throat_kinetic_energy_flux,
+                       orc.throat_kinetic_energy_flux, rt);
+      ok &= closeArray(name, "throat_normal_zyx", dist.throat_normal_zyx, orc.throat_normal_zyx, rt);
+      ok &= closeArray(name, "throat_centroid_zyx", dist.throat_centroid_zyx,
+                       orc.throat_centroid_zyx, rt);
+      ok &= closeArray(name, "throat_dp_mean", dist.throat_dp_mean, orc.throat_dp_mean, rt);
+      ok &= closeArray(name, "pore_volume", dist.pore_volume, orc.pore_volume, 0.0);
+      ok &= closeArray(name, "pore_mean_pressure", dist.pore_mean_pressure, orc.pore_mean_pressure,
+                       rt);
+      ok &= closeArray(name, "pore_mean_kinetic_energy", dist.pore_mean_kinetic_energy,
+                       orc.pore_mean_kinetic_energy, rt);
+      ok &= closeArray(name, "pore_mean_velocity_zyx", dist.pore_mean_velocity_zyx,
+                       orc.pore_mean_velocity_zyx, rt);
+      ok &= closeArray(name, "pore_volume_centroid_zyx", dist.pore_volume_centroid_zyx,
+                       orc.pore_volume_centroid_zyx, 0.0);
+      fail = ok ? 0 : 1;
     }
     if (!fail)
       std::printf("[%s] PASS: %zu pores, %zu throats match the single-rank oracle\n", name,

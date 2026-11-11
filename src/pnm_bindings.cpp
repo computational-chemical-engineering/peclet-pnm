@@ -127,6 +127,12 @@ static nb::ndarray<nb::numpy, double> doubles_to_ndarray(std::vector<double>&& v
   return peclet::core::python::vector_to_ndarray<double>(std::move(v), {n}, {1});
 }
 
+// Flat z-y-x-interleaved triples -> (count,3) float64 array over the vector's own storage.
+static nb::ndarray<nb::numpy, double> triples_to_ndarray(std::vector<double>&& v) {
+  const std::size_t m = v.size() / 3;
+  return peclet::core::python::vector_to_ndarray<double>(std::move(v), {m, 3}, {3, 1});
+}
+
 // The network-flow result as the documented dict (pores: list[Pore]; everything else ndarray).
 static nb::dict network_flow_dict(pnm::NetworkFlow&& net) {
   nb::dict d;
@@ -137,6 +143,16 @@ static nb::dict network_flow_dict(pnm::NetworkFlow&& net) {
   d["throat_flow"] = doubles_to_ndarray(std::move(net.throat_flow));
   d["throat_area"] = doubles_to_ndarray(std::move(net.throat_area));
   d["throat_dp"] = doubles_to_ndarray(std::move(net.throat_dp));
+  d["throat_momentum_flux_zyx"] = triples_to_ndarray(std::move(net.throat_momentum_flux_zyx));
+  d["throat_kinetic_energy_flux"] = doubles_to_ndarray(std::move(net.throat_kinetic_energy_flux));
+  d["throat_normal_zyx"] = triples_to_ndarray(std::move(net.throat_normal_zyx));
+  d["throat_centroid_zyx"] = triples_to_ndarray(std::move(net.throat_centroid_zyx));
+  d["throat_dp_mean"] = doubles_to_ndarray(std::move(net.throat_dp_mean));
+  d["pore_volume"] = doubles_to_ndarray(std::move(net.pore_volume));
+  d["pore_mean_pressure"] = doubles_to_ndarray(std::move(net.pore_mean_pressure));
+  d["pore_mean_kinetic_energy"] = doubles_to_ndarray(std::move(net.pore_mean_kinetic_energy));
+  d["pore_mean_velocity_zyx"] = triples_to_ndarray(std::move(net.pore_mean_velocity_zyx));
+  d["pore_volume_centroid_zyx"] = triples_to_ndarray(std::move(net.pore_volume_centroid_zyx));
   return d;
 }
 
@@ -146,6 +162,20 @@ static constexpr const char* kNetworkFlowDictDoc =
     "\n\nReturns a dict: 'pores' (list[Pore], ordered by label: pores[k] is label k+1), "
     "'pore_pressure' and 'pore_residual' (float64 (N,)), 'throats' ((M,2) int32 label pairs "
     "a < b, per PATCH), 'throat_flow', 'throat_area' and 'throat_dp' (float64 (M,)).\n\n"
+    "Momentum/volume extension (per unit density; a throat is oriented throats[t,0] -> "
+    "throats[t,1] as throat_flow; every *_zyx array is (count,3) float64 with columns z, y, x): "
+    "'throat_momentum_flux_zyx' (M,3) = sum over the patch faces of o*A*u_vec*(u.n), u_vec the "
+    "face-centre velocity (normal = the MAC face value, each tangential component the mean of "
+    "the 4 nearest staggered values); 'throat_kinetic_energy_flux' (M,) = sum o*A*|u_vec|^2/2*"
+    "(u.n); 'throat_normal_zyx' (M,3) = sum o*A*n / sum o*A (oriented, NOT normalised: |n| < 1 "
+    "on a curved patch); 'throat_centroid_zyx' (M,3), open-area weighted, in the periodic image "
+    "nearest pore throats[t,0]'s peak voxel (not wrapped into the box); 'throat_dp_mean' (M,) = "
+    "throat_dp evaluated with pore_mean_pressure at the volume centroids. Per pore, over the "
+    "fluid cells (sdf > 0) of its watershed segment: 'pore_volume' (N,), 'pore_mean_pressure' "
+    "(N,) (periodic part of p, as pore_pressure), 'pore_mean_kinetic_energy' (N,) = mean "
+    "|u_c|^2/2 and 'pore_mean_velocity_zyx' (N,3) with u_c the cell-centred velocity (mean of "
+    "the cell's two faces per component), 'pore_volume_centroid_zyx' (N,3) in the image of the "
+    "pore's peak voxel.\n\n"
     "PRECONDITION (cross-repo, not checkable here): the openness arrays must be the face "
     "openness the velocity field was projected with. For peclet.flow's cut-cell IBM that means "
     "the solid was set with set_solid(..., cutcell_pressure=True) — without it every openness "
