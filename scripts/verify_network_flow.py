@@ -42,6 +42,7 @@ s.set_rho(1.0)
 s.set_mu(MU)
 s.set_dt(100.0)
 s.set_body_force((FX, 0.0, 0.0))   # one 3-sequence since 1.0.0 (the clean break)
+s.set_advection(False)  # Stokes: flow advects by default since 2026-10-23
 s.set_solid(np.asfortranarray(sdf), cutcell_pressure=True)  # openness-weighted flux o*u*A
 for _ in range(60):
     s.step()
@@ -82,6 +83,58 @@ def check(name, ok, detail):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
     fails += 0 if ok else 1
 
+
+def check_momentum(tag, net, sdf_xyz, symmetric, on_axis=None):
+    """The momentum/volume extension on a tube network (Stokes, all tubes along x).
+
+    * Cauchy-Schwarz with the SAME discrete weights w = o*A as Q and A_t: on a PLANAR throat (all
+      faces share one normal, |n| = 1) M.n = sum w*un^2 >= Q^2/A_t. (A chamber-tube watershed
+      interface is a staircased cone, |n| ~ 0.5: there M.n is not sum w*un^2 and the bound is not
+      a theorem, so it is only reported.)
+    * Jensen with u.n > 0 (Stokes tube flow, throats oriented along Q): KE flux
+      sum w*|u|^2/2*un >= sum w*un^3/2 >= Q^3/(2 A_t^2), on every throat.
+    * the mean normal points along the tube axis (n/|n| = +-e_x) on the throats of on-axis tubes
+      (`on_axis`, default all; an off-axis capsule meets its chamber on a tilted interface), and
+      on the mirror-symmetric chain (`symmetric`) the momentum flux has no component across it
+      (|M_t| <= 1e-8 |M.n^|);
+    * the pore volumes partition the fluid (sdf > 0 cells) exactly;
+    * the volume-mean total pressure falls along the flow: throat_dp_mean has the sign of Q."""
+    Q = np.asarray(net["throat_flow"])
+    At = np.asarray(net["throat_area"])
+    M = np.asarray(net["throat_momentum_flux_zyx"])[:, ::-1]  # -> x, y, z columns
+    K = np.asarray(net["throat_kinetic_energy_flux"])
+    N = np.asarray(net["throat_normal_zyx"])[:, ::-1]
+    dpm = np.asarray(net["throat_dp_mean"])
+    nrm = np.linalg.norm(N, axis=1)
+    Nh = N / nrm[:, None]
+    planar = np.abs(nrm - 1.0) < 1e-12
+    Mn = np.einsum("ij,ij->i", M, Nh)
+    Mt = np.linalg.norm(M - Mn[:, None] * Nh, axis=1)
+    cs = Mn / (Q**2 / At)
+    je = K / (Q**3 / (2 * At**2))
+    for t in range(len(Q)):
+        print(f"  {tag} throat {t}: |n|={nrm[t]:.6f} n^_x={Nh[t,0]: .12f} M.n^/(Q^2/A)={cs[t]:.6f} "
+              f"K/(Q^3/2A^2)={je[t]:.6f} |M_t|/|M.n^|={Mt[t]/abs(Mn[t]):.2e} dp_mean={dpm[t]: .4e}")
+    eps = 1e-12
+    check(f"{tag} momentum flux >= Q^2/A_t on planar throats (Cauchy-Schwarz)",
+          bool(planar.any() and np.all(cs[planar] >= 1 - eps)),
+          f"{int(planar.sum())}/{len(Q)} planar, min ratio {np.min(cs[planar]):.6f}")
+    check(f"{tag} KE flux >= Q^3/(2 A_t^2) (Jensen, u.n > 0)", bool(np.all(je >= 1 - eps)),
+          f"min ratio {np.min(je):.6f}")
+    ax = np.arange(len(Q)) if on_axis is None else np.asarray(on_axis, int)
+    dev = np.abs(np.abs(Nh[ax, 0]) - 1)
+    check(f"{tag} throat normal along the tube axis", bool(np.all(dev < 1e-12)),
+          f"{len(ax)} on-axis throats, max ||n^_x|-1| = {np.max(dev):.2e}")
+    if symmetric:
+        check(f"{tag} tangential momentum flux ~ 0 (mirror-symmetric tube)",
+              bool(np.all(Mt <= 1e-8 * np.abs(Mn))), f"max |M_t|/|M.n^| = {np.max(Mt / np.abs(Mn)):.2e}")
+    nfluid = int((sdf_xyz.astype(np.float32) > 0).sum())
+    vol = np.asarray(net["pore_volume"])
+    check(f"{tag} pore volumes partition the fluid", abs(vol.sum() - nfluid) <= 1e-12 * nfluid,
+          f"sum = {vol.sum():.1f} vs {nfluid} fluid cells")
+    check(f"{tag} volume-mean pressure falls along the flow", bool(np.all(Q * dpm > 0)),
+          f"signs Q*dp_mean: {np.sign(Q * dpm).astype(int).tolist()}")
+
 check("steady plane flux", plane_dev < 1e-6, f"max deviation {plane_dev:.2e}")
 # Watershed topology: the chambers + the wrap tube segment (the mid-tube plateau drains into the
 # chamber basins — only the wrap segment keeps a gid-seam peak). A single loop: #throats == #pores.
@@ -94,6 +147,7 @@ check("throat flux = DNS flux", np.abs(np.abs(Q) - abs(F)).max() < 1e-3 * abs(F)
       f"max ||Q|-F|/F = {np.abs(np.abs(Q)-abs(F)).max()/abs(F):.2e}")
 check("Q, dp sign-consistent (g>0)", bool(np.all(Q * dp > 0)),
       f"signs: {np.sign(Q*dp).astype(int).tolist()}")
+check_momentum("case1", net, sdf, symmetric=True)
 
 # ================= case 2: asymmetric chamber lattice (a genuine network) ======================
 # 4 chambers in a 2x2 (y,z) arrangement, connected along x by tubes of DIFFERENT radii through
@@ -113,6 +167,7 @@ for (cy, cz, rt) in ((12.0, 12.0, 3.0), (12.0, 36.0, 4.0), (36.0, 12.0, 5.0), (3
 s = peclet.flow.Solver(NX2, NY2, NZ2)
 s.set_rho(1.0); s.set_mu(MU); s.set_dt(100.0)
 s.set_body_force((FX, 0.0, 0.0))   # one 3-sequence since 1.0.0 (the clean break)
+s.set_advection(False)  # Stokes: flow advects by default since 2026-10-23
 s.set_solid(np.asfortranarray(sdf2), cutcell_pressure=True)
 for _ in range(60):
     s.step()
@@ -148,7 +203,8 @@ del s
 s = peclet.flow.Solver(NX, NY, NZ)
 s.set_rho(1.0); s.set_mu(MU); s.set_dt(100.0)
 s.set_body_force((FX, 0.0, 0.0))   # one 3-sequence since 1.0.0 (the clean break)
-s.set_ghost_projection(True)
+s.set_advection(False)  # Stokes: flow advects by default since 2026-10-23
+s.diagnostics.set_ghost_projection(True)  # diagnostics tier since 1.0.0
 s.set_solid(np.asfortranarray(sdf), cutcell_pressure=True)
 for _ in range(60):
     s.step()
@@ -211,6 +267,7 @@ sdf4 = np.maximum(sdf4, 4.0 - np.sqrt((xw - xs) ** 2 + (y - 16.0) ** 2 + (z - 16
 s = peclet.flow.Solver(NX4, NY4, NZ4)
 s.set_rho(1.0); s.set_mu(MU); s.set_dt(100.0)
 s.set_body_force((FX, 0.0, 0.0))   # one 3-sequence since 1.0.0 (the clean break)
+s.set_advection(False)  # Stokes: flow advects by default since 2026-10-23
 s.set_solid(np.asfortranarray(sdf4), cutcell_pressure=True)
 for _ in range(60):
     s.step()
@@ -248,6 +305,7 @@ check("case4 wrap throats carry F", bool(np.all(np.abs(np.abs(Q4[wrapT]) - abs(F
       f"|Q| = {np.abs(Q4[wrapT]).tolist()}")
 check("case4 g>0 on all throats", bool(np.all(Q4 * dp4 > 0)),
       f"signs: {np.sign(Q4*dp4).astype(int).tolist()}")
+check_momentum("case4", net4, sdf4, symmetric=False, on_axis=wrapT)
 
 print("PASS" if fails == 0 else f"FAIL ({fails})")
 del s  # release the solver's device Views BEFORE interpreter exit (flow's finalize contract)
