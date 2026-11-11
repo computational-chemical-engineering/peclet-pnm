@@ -102,7 +102,24 @@ net["pore_pressure"]   # periodic p interpolated at each pore center (basin SDF 
 net["throat_dp"]       # total-pressure drop P_i - P_j (periodic parts + macro gradient
                        # along the throat-anchored min-image path)
 net["pore_residual"]   # signed flux over each pore's whole boundary — ~ solver tolerance
+# momentum / energy / volume extension (per unit density; *_zyx = (count,3), columns z, y, x)
+net["throat_momentum_flux_zyx"]    # (M,3) sum o·A·u_vec·(u·n), oriented throats[t,0] -> [t,1]
+net["throat_kinetic_energy_flux"]  # (M,)  sum o·A·½|u_vec|²·(u·n)
+net["throat_normal_zyx"]           # (M,3) sum o·A·n / sum o·A (oriented; |n| < 1 if curved)
+net["throat_centroid_zyx"]         # (M,3) open-area-weighted, image of pore throats[t,0]
+net["throat_dp_mean"]              # (M,)  throat_dp from the volume-mean pressures/centroids
+net["pore_volume"]                 # (N,)  fluid volume (sdf > 0 cells) of the watershed segment
+net["pore_mean_pressure"]          # (N,)  volume mean of the periodic p
+net["pore_mean_kinetic_energy"]    # (N,)  volume mean of ½|u_c|² (u_c: cell-centred velocity)
+net["pore_mean_velocity_zyx"]      # (N,3) volume mean of u_c
+net["pore_volume_centroid_zyx"]    # (N,3) image of the pore's peak voxel
 ```
+
+The face-centre velocity `u_vec` of a throat face takes the MAC value for the normal component
+and, for each tangential component, the plain mean of the 4 nearest staggered values (the two
+faces of each of the face's two cells). Total head per pore is
+`pore_mean_pressure + rho * pore_mean_kinetic_energy` (plus the macro gradient, as in
+`throat_dp_mean`).
 
 The openness arrays must be the ones the velocity field was projected with: with peclet.flow's
 cut-cell IBM that requires `set_solid(..., cutcell_pressure=True)` — without it every openness

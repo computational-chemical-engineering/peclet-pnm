@@ -30,7 +30,10 @@ is pure C++. Part of the peclet suite (see `../CLAUDE.md` and `../docs/` for sui
   flat int32 array in, zero-copy → `(M,2)` int32 ndarray), the fused `extract_pore_network` (SDF
   uploaded once, segmentation device-resident across stages → `(pores, seg, connections)` with
   the same three types), `extract_network_flow` (→ dict: `pores` list, `throats` `(M,2)` int32,
-  five float64 arrays), and under `PECLET_PNM_MPI` `mpi_block` (→ `(offset_zyx, shape_zyx)`, two
+  five float64 arrays + the momentum/volume extension: `throat_momentum_flux_zyx`,
+  `throat_kinetic_energy_flux`, `throat_normal_zyx`, `throat_centroid_zyx`, `throat_dp_mean`,
+  `pore_volume`, `pore_mean_pressure`, `pore_mean_kinetic_energy`, `pore_mean_velocity_zyx`,
+  `pore_volume_centroid_zyx`), and under `PECLET_PNM_MPI` `mpi_block` (→ `(offset_zyx, shape_zyx)`, two
   int 3-tuples in VOXELS — not the physical `origin_zyx`) + `extract_pore_network_mpi` /
   `extract_network_flow_mpi`. The host vectors are moved into capsule-owned NumPy arrays
   (`vector_to_ndarray`, core's zero-copy bridge) — never `std::vector` → `list` boxing
@@ -51,6 +54,18 @@ is pure C++. Part of the peclet suite (see `../CLAUDE.md` and `../docs/` for sui
   throat dp uses a throat-anchored two-leg min-image (single min-image is ambiguous at L/2);
   per-pore residual ~ solver tolerance is the built-in correctness check. Validated:
   `scripts/verify_network_flow.py` (|Q|=F to 1e-11 on tube networks, g>0, Kirchhoff exact).
+  MOMENTUM/VOLUME EXTENSION (2026-11, paper A7): `throatFlux` also sums, per throat face
+  (w0 = o·A, n = ±e_d oriented lower->higher label), w0·u_vec·(u·n), w0·½|u_vec|²·(u·n) and w0·n
+  into one `ext` view (`kThroatExt`); u_vec = normal MAC value + tangentials as the plain mean
+  of the 4 nearest staggered faces (`faceVelocity`). `poreVolume` sums per WATERSHED SEGMENT
+  (seg; == the flow basin on fluid cells) over sdf > 0 cells (no cell volume fraction is passed
+  in): count, p, ½|u_c|², u_c, and the INTEGER min-image offset from the peak voxel — count and
+  centroid are exact integer sums, hence bitwise across decompositions; the rest are atomic-order
+  close (~1e-15). Host finishers `throatExtras`/`poreVolumeStats` are shared by both pipelines;
+  `throat_dp_mean` reuses the two-leg dp with the volume centroids. Vector outputs are flat
+  z-y-x (`*_zyx`, (count,3) in Python). Centroids are reported in the image frame of their
+  anchor pore, NOT wrapped into the box (no float image decision). The existing five arrays are
+  byte-identical (state_hash).
   On loose packings per-throat g=Q/dp scatters (intra-pore viscous variation ~ throat drops —
   real physics, not a bug; the p field's grid-scale roughness μ∇²u·h ≈ 20× the macro gradient).
   GHOST-CELL IBM (`set_ghost_projection`): pass flow's `get_ox_proj/...` (binary COUPLED
