@@ -134,6 +134,25 @@ def check_momentum(tag, net, sdf_xyz, symmetric, on_axis=None):
           f"sum = {vol.sum():.1f} vs {nfluid} fluid cells")
     check(f"{tag} volume-mean pressure falls along the flow", bool(np.all(Q * dpm > 0)),
           f"signs Q*dp_mean: {np.sign(Q * dpm).astype(int).tolist()}")
+    # per-pore mechanical-energy balance (rho = 1, body force FX along x, periodic p):
+    # D_p = -sum_t s_t (W_t + rho*KE_t) + f <u_x>_p V_p, s_t = +1 when p is throats[t,0]
+    W = np.asarray(net["throat_pressure_work_flux"])
+    th = np.asarray(net["throats"])
+    npo = len(net["pores"])
+    out = np.zeros(npo)
+    np.add.at(out, th[:, 0] - 1, W + K)
+    np.add.at(out, th[:, 1] - 1, -(W + K))
+    Vp = np.asarray(net["pore_volume"])
+    ux = np.asarray(net["pore_mean_velocity_zyx"])[:, 2]
+    power = FX * ux * Vp
+    D = power - out
+    print(f"  {tag} pore energy: body-force power {np.round(power, 6).tolist()}, "
+          f"net (pW + KE) outflow {np.round(out, 6).tolist()}, D_p {np.round(D, 6).tolist()}")
+    check(f"{tag} per-pore dissipation D_p > 0", bool(np.all(D > 0)),
+          f"min D_p / body-force power = {np.min(D / power):.4f}")
+    # globally the throat terms cancel pairwise: sum D_p == f * int u_x dV over the fluid cells
+    check(f"{tag} throat energy fluxes cancel globally", abs(out.sum()) <= 1e-12 * power.sum(),
+          f"|sum net outflow| / sum power = {abs(out.sum()) / power.sum():.2e}")
 
 check("steady plane flux", plane_dev < 1e-6, f"max deviation {plane_dev:.2e}")
 # Watershed topology: the chambers + the wrap tube segment (the mid-tube plateau drains into the

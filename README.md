@@ -105,6 +105,7 @@ net["pore_residual"]   # signed flux over each pore's whole boundary — ~ solve
 # momentum / energy / volume extension (per unit density; *_zyx = (count,3), columns z, y, x)
 net["throat_momentum_flux_zyx"]    # (M,3) sum o·A·u_vec·(u·n), oriented throats[t,0] -> [t,1]
 net["throat_kinetic_energy_flux"]  # (M,)  sum o·A·½|u_vec|²·(u·n)
+net["throat_pressure_work_flux"]   # (M,)  sum o·A·p_f·(u·n), p_f = mean of the two cells' p
 net["throat_normal_zyx"]           # (M,3) sum o·A·n / sum o·A (oriented; |n| < 1 if curved)
 net["throat_centroid_zyx"]         # (M,3) open-area-weighted, image of pore throats[t,0]
 net["throat_dp_mean"]              # (M,)  throat_dp from the volume-mean pressures/centroids

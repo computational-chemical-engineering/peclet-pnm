@@ -164,7 +164,10 @@ int runConfig(const char* name, bool withOpen, MPI_Comm comm) {
                            orc.throat_momentum_flux_zyx, rt);
       ok &= closeArray(name, "throat_kinetic_energy_flux", dist.throat_kinetic_energy_flux,
                        orc.throat_kinetic_energy_flux, rt);
-      ok &= closeArray(name, "throat_normal_zyx", dist.throat_normal_zyx, orc.throat_normal_zyx, rt);
+      ok &= closeArray(name, "throat_pressure_work_flux", dist.throat_pressure_work_flux,
+                       orc.throat_pressure_work_flux, rt);
+      ok &=
+          closeArray(name, "throat_normal_zyx", dist.throat_normal_zyx, orc.throat_normal_zyx, rt);
       ok &= closeArray(name, "throat_centroid_zyx", dist.throat_centroid_zyx,
                        orc.throat_centroid_zyx, rt);
       ok &= closeArray(name, "throat_dp_mean", dist.throat_dp_mean, orc.throat_dp_mean, rt);

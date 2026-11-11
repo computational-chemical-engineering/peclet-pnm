@@ -145,6 +145,7 @@ static nb::dict network_flow_dict(pnm::NetworkFlow&& net) {
   d["throat_dp"] = doubles_to_ndarray(std::move(net.throat_dp));
   d["throat_momentum_flux_zyx"] = triples_to_ndarray(std::move(net.throat_momentum_flux_zyx));
   d["throat_kinetic_energy_flux"] = doubles_to_ndarray(std::move(net.throat_kinetic_energy_flux));
+  d["throat_pressure_work_flux"] = doubles_to_ndarray(std::move(net.throat_pressure_work_flux));
   d["throat_normal_zyx"] = triples_to_ndarray(std::move(net.throat_normal_zyx));
   d["throat_centroid_zyx"] = triples_to_ndarray(std::move(net.throat_centroid_zyx));
   d["throat_dp_mean"] = doubles_to_ndarray(std::move(net.throat_dp_mean));
@@ -167,7 +168,9 @@ static constexpr const char* kNetworkFlowDictDoc =
     "'throat_momentum_flux_zyx' (M,3) = sum over the patch faces of o*A*u_vec*(u.n), u_vec the "
     "face-centre velocity (normal = the MAC face value, each tangential component the mean of "
     "the 4 nearest staggered values); 'throat_kinetic_energy_flux' (M,) = sum o*A*|u_vec|^2/2*"
-    "(u.n); 'throat_normal_zyx' (M,3) = sum o*A*n / sum o*A (oriented, NOT normalised: |n| < 1 "
+    "(u.n); 'throat_pressure_work_flux' (M,) = sum o*A*p_f*(u.n), p_f the mean of the two "
+    "adjacent cell pressures (periodic part); 'throat_normal_zyx' (M,3) = sum o*A*n / sum o*A "
+    "(oriented, NOT normalised: |n| < 1 "
     "on a curved patch); 'throat_centroid_zyx' (M,3), open-area weighted, in the periodic image "
     "nearest pore throats[t,0]'s peak voxel (not wrapped into the box); 'throat_dp_mean' (M,) = "
     "throat_dp evaluated with pore_mean_pressure at the volume centroids. Per pore, over the "

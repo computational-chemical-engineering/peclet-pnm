@@ -241,8 +241,9 @@ struct NetworkFlow {
                                              //   (p_i - p_j) - grad_p · minimage(x_j - x_i)
   // Momentum / energy extension (paper A7). Per unit density; orientation li -> lj as throat_flow.
   // Every *_zyx vector is flat (3*count), row k = (z, y, x) — the binding's (count,3) array.
-  std::vector<double> throat_momentum_flux_zyx;   // sum o·A·u_vec·(u·n), u_vec at the face centre
+  std::vector<double> throat_momentum_flux_zyx;  // sum o·A·u_vec·(u·n), u_vec at the face centre
   std::vector<double> throat_kinetic_energy_flux;  // sum o·A·½|u_vec|²·(u·n)
+  std::vector<double> throat_pressure_work_flux;   // sum o·A·p_f·(u·n), p_f = face-mean p
   std::vector<double> throat_normal_zyx;    // sum o·A·n / sum o·A (oriented, not normalised)
   std::vector<double> throat_centroid_zyx;  // area-weighted, in the image frame of pore li
   std::vector<double> throat_dp_mean;       // as throat_dp, from pore_mean_pressure + centroids
@@ -258,6 +259,7 @@ inline void assignExtras(NetworkFlow& out, kernels::ThroatExtras&& te,
                          kernels::PoreVolumeStats&& ps, std::vector<double>&& dpMean) {
   out.throat_momentum_flux_zyx = std::move(te.momentum_flux_zyx);
   out.throat_kinetic_energy_flux = std::move(te.kinetic_energy_flux);
+  out.throat_pressure_work_flux = std::move(te.pressure_work_flux);
   out.throat_normal_zyx = std::move(te.normal_zyx);
   out.throat_centroid_zyx = std::move(te.centroid_zyx);
   out.throat_dp_mean = std::move(dpMean);
@@ -460,7 +462,7 @@ inline NetworkFlow extract_network_flow_k(
   Kokkos::View<double*, Mem> Q("nf::Q", nt), A("nf::A", nt), resid("nf::resid", np);
   Kokkos::View<double*, Mem> Cx("nf::Cx", nt), Cy("nf::Cy", nt), Cz("nf::Cz", nt);
   Kokkos::View<double*, Mem> ext("nf::ext", kn::kThroatExt * nt);
-  kn::throatFlux(space, geo, flowLab, u, v, w, ox, oy, oz, hasOpen, fpar, keyD, slotD, nt, ancXD,
+  kn::throatFlux(space, geo, flowLab, u, v, w, p, ox, oy, oz, hasOpen, fpar, keyD, slotD, nt, ancXD,
                  ancYD, ancZD, origin, spacing, resolution, Q, A, Cx, Cy, Cz, resid, ext);
   std::vector<double> hcx = downloadN(Cx, nt), hcy = downloadN(Cy, nt), hcz = downloadN(Cz, nt);
   {
@@ -495,11 +497,11 @@ inline NetworkFlow extract_network_flow_k(
     pacc = downloadN(acc, std::size_t(kn::kPoreVol) * np);
   }
   auto ps = kn::poreVolumeStats(pacc, np, spacing, ancX, ancY, ancZ);
-  auto dpMean = kn::throatPressureDrops(out.throats, ps.cx, ps.cy, ps.cz, ps.mean_pressure,
-                                        out.throat_area, hcx, hcy, hcz, ancX, ancY, ancZ, spacing,
-                                        resolution, grad_p);
-  auto te = kn::throatExtras(out.throats, downloadN(ext, kn::kThroatExt * nt), out.throat_area,
-                             hcx, hcy, hcz, ancX, ancY, ancZ);
+  auto dpMean =
+      kn::throatPressureDrops(out.throats, ps.cx, ps.cy, ps.cz, ps.mean_pressure, out.throat_area,
+                              hcx, hcy, hcz, ancX, ancY, ancZ, spacing, resolution, grad_p);
+  auto te = kn::throatExtras(out.throats, downloadN(ext, kn::kThroatExt * nt), out.throat_area, hcx,
+                             hcy, hcz, ancX, ancY, ancZ);
   assignExtras(out, std::move(te), std::move(ps), std::move(dpMean));
   return out;
 }
