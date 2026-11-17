@@ -66,7 +66,7 @@ pores, seg, conns = pnm.extract_pore_network(sdf_3d, origin_zyx, spacing_zyx)
 
 Conventions: the SDF array is `(Nz, Ny, Nx)` C-order (x fastest) and every triple that describes
 it (`origin_zyx`, `spacing_zyx`, `shape_zyx`, `grad_p_zyx`) is z-y-x, marked by the suffix; SDF
-sign is negative inside the solid — see the suite's `docs/CONVENTIONS.md` and `docs/NAMING.md` §1.7.
+sign is negative inside the solid — see the suite's `../docs/CONVENTIONS.md` and `../docs/NAMING.md` §1.7.
 (`Pore.x/y/z` are three self-named scalars, not a triple, so they carry no suffix.) Arrays in,
 arrays out: `segment_volume` returns the labels as an int32 array of the SDF's shape (the kernels'
 flat x-fastest vector re-shaped in place, no copy), `extract_topology` reads that array back
