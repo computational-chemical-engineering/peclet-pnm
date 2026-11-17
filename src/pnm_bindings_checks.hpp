@@ -33,9 +33,10 @@ inline std::string num(double v) {
 }
 inline void require(bool ok, const char* who, const std::string& name, const std::string& rule,
                     double v) {
-  if (!ok)
+  if (!ok) {
     throw std::invalid_argument(std::string(who) + ": " + name + " must be " + rule + ", got " +
                                 num(v));
+  }
 }
 inline std::string component(const char* name, std::size_t i) {
   return std::string(name) + "[" + std::to_string(i) + "]";
@@ -43,20 +44,22 @@ inline std::string component(const char* name, std::size_t i) {
 
 /// A z-y-x triple: exactly three values.
 inline void triple(const char* who, const char* name, std::size_t size) {
-  if (size != 3)
+  if (size != 3) {
     throw std::invalid_argument(std::string(who) + ": " + name +
                                 " must be 3 values (z, y, x), got " + std::to_string(size));
+  }
 }
 /// Each component finite once narrowed to float32 (a coordinate: any sign).
-inline void finite_each(const char* who, const char* name, const std::vector<double>& a,
-                        const char* dim) {
-  for (std::size_t i = 0; i < a.size(); ++i)
+inline void finiteEach(const char* who, const char* name, const std::vector<double>& a,
+                       const char* dim) {
+  for (std::size_t i = 0; i < a.size(); ++i) {
     require(std::isfinite(static_cast<float>(a[i])), who, component(name, i),
             std::string("finite as float32 (") + dim + ")", a[i]);
+  }
 }
 /// Each component finite and > 0 once narrowed to float32 (a cell size).
-inline void positive_each(const char* who, const char* name, const std::vector<double>& a,
-                          const char* dim) {
+inline void positiveEach(const char* who, const char* name, const std::vector<double>& a,
+                         const char* dim) {
   for (std::size_t i = 0; i < a.size(); ++i) {
     const float f = static_cast<float>(a[i]);
     require(std::isfinite(f) && f > 0.0f, who, component(name, i),
@@ -64,48 +67,52 @@ inline void positive_each(const char* who, const char* name, const std::vector<d
   }
 }
 /// Each component an integer >= `lo` (a voxel count).
-inline void count_each(const char* who, const char* name, const std::vector<int>& a, int lo) {
-  for (std::size_t i = 0; i < a.size(); ++i)
+inline void countEach(const char* who, const char* name, const std::vector<int>& a, int lo) {
+  for (std::size_t i = 0; i < a.size(); ++i) {
     require(a[i] >= lo, who, component(name, i),
             "an integer >= " + std::to_string(lo) + " (voxels)", a[i]);
+  }
 }
 
 // --- the checks of one binding entry point ------------------------------------------------
 
 /// spacing_zyx: the grid's cell size per axis, three values > 0 (length units).
-inline void spacing_zyx(const char* who, const std::vector<double>& spacing) {
+inline void spacingZyx(const char* who, const std::vector<double>& spacing) {
   triple(who, "spacing_zyx", spacing.size());
-  positive_each(who, "spacing_zyx", spacing, "length units");
+  positiveEach(who, "spacing_zyx", spacing, "length units");
 }
 /// origin_zyx + spacing_zyx of extract_pores / extract_pore_network(_mpi).
 inline void grid(const char* who, const std::vector<double>& origin,
                  const std::vector<double>& spacing) {
   triple(who, "origin_zyx", origin.size());
-  finite_each(who, "origin_zyx", origin, "length units");
-  spacing_zyx(who, spacing);
+  finiteEach(who, "origin_zyx", origin, "length units");
+  spacingZyx(who, spacing);
 }
 /// The global grid of the ORB decomposition: at least one voxel per axis. `sized` = the length
 /// was already checked (mpi_block's own RuntimeError predates this round).
-inline void global_shape_zyx(const char* who, const std::vector<int>& shape, bool sized) {
-  if (!sized)
+inline void globalShapeZyx(const char* who, const std::vector<int>& shape, bool sized) {
+  if (!sized) {
     triple(who, "global_shape_zyx", shape.size());
-  count_each(who, "global_shape_zyx", shape, 1);
+  }
+  countEach(who, "global_shape_zyx", shape, 1);
 }
 /// extract_topology's shape_zyx, when given as three values: voxel counts >= 0 whose product
 /// fits in std::size_t (a wrapped product could match the flat array's length). A wrong length
 /// is left to the binding's own RuntimeError.
-inline void topology_shape(const std::optional<std::vector<int>>& shape) {
-  if (!shape || shape->size() != 3)
+inline void topologyShape(const std::optional<std::vector<int>>& shape) {
+  if (!shape || shape->size() != 3) {
     return;
-  count_each("extract_topology", "shape_zyx", *shape, 0);
+  }
+  countEach("extract_topology", "shape_zyx", *shape, 0);
   std::size_t n = 1;
-  for (int s : *shape)
+  for (int s : *shape) {
     require(!__builtin_mul_overflow(n, static_cast<std::size_t>(s), &n), "extract_topology",
             "shape_zyx", "a grid whose voxel count fits in 64 bits", static_cast<double>(s));
+  }
 }
 
 /// Pore(x, y, z, radius): a finite centre and a finite radius >= 0 (Pore() is all zeros).
-inline void init_pore(Pore* p, float x, float y, float z, float radius) {
+inline void initPore(Pore* p, float x, float y, float z, float radius) {
   require(std::isfinite(x), "Pore", "x", "finite (length units)", x);
   require(std::isfinite(y), "Pore", "y", "finite (length units)", y);
   require(std::isfinite(z), "Pore", "z", "finite (length units)", z);

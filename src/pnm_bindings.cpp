@@ -237,7 +237,7 @@ NB_MODULE(_pnm, m) {
                    "no axis order is implied and no _zyx suffix applies — the documented "
                    "exception to NAMING.md 1.7.")
       .def(nb::init<>())
-      .def("__init__", &chk::init_pore, nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("radius"))
+      .def("__init__", &chk::initPore, nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("radius"))
       .def_rw("x", &Pore::x, "Centre x coordinate (physical units of origin_zyx / spacing_zyx).")
       .def_rw("y", &Pore::y, "Centre y coordinate (physical units of origin_zyx / spacing_zyx).")
       .def_rw("z", &Pore::z, "Centre z coordinate (physical units of origin_zyx / spacing_zyx).")
@@ -273,7 +273,7 @@ NB_MODULE(_pnm, m) {
   m.def(
       "segment_volume",
       [](nb::ndarray<float, nb::c_contig> sdf, std::vector<double> spacing_zyx) {
-        chk::spacing_zyx("segment_volume", spacing_zyx);
+        chk::spacingZyx("segment_volume", spacing_zyx);
         std::array<int, 3> res;
         auto v = to_sdf(sdf, res);
         std::array<float, 3> spc{(float)spacing_zyx[2], (float)spacing_zyx[1],
@@ -296,7 +296,7 @@ NB_MODULE(_pnm, m) {
       "extract_topology",
       [](nb::ndarray<const int, nb::c_contig> segmentation,
          std::optional<std::vector<int>> shape_zyx) {
-        chk::topology_shape(shape_zyx);
+        chk::topologyShape(shape_zyx);
         std::array<int, 3> res;
         if (segmentation.ndim() == 3) {
           res = {(int)segmentation.shape(2), (int)segmentation.shape(1),
@@ -417,7 +417,7 @@ NB_MODULE(_pnm, m) {
         ensure_mpi_init();
         if (global_shape_zyx.size() != 3)
           throw std::runtime_error("global_shape_zyx must be (Nz, Ny, Nx)");
-        chk::global_shape_zyx("mpi_block", global_shape_zyx, /*sized=*/true);
+        chk::globalShapeZyx("mpi_block", global_shape_zyx, /*sized=*/true);
         std::array<int, 3> gd{global_shape_zyx[2], global_shape_zyx[1], global_shape_zyx[0]};
         std::array<int, 3> o{}, s{};
         pnm::mpi_block_of(gd, MPI_COMM_WORLD, o, s);
@@ -434,7 +434,7 @@ NB_MODULE(_pnm, m) {
       "extract_pore_network_mpi",
       [](nb::ndarray<float, nb::c_contig> sdf_local, std::vector<int> global_shape_zyx,
          std::vector<double> origin_zyx, std::vector<double> spacing_zyx) {
-        chk::global_shape_zyx("extract_pore_network_mpi", global_shape_zyx, /*sized=*/false);
+        chk::globalShapeZyx("extract_pore_network_mpi", global_shape_zyx, /*sized=*/false);
         chk::grid("extract_pore_network_mpi", origin_zyx, spacing_zyx);
         ensure_mpi_init();
         std::array<int, 3> res;
