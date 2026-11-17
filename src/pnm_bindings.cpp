@@ -239,8 +239,8 @@ NB_MODULE(_pnm, m) {
       .def(nb::init<>())
       .def("__init__", &chk::init_pore, nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("radius"))
       .def_rw("x", &Pore::x, "Centre x coordinate (physical units of origin_zyx / spacing_zyx).")
-      .def_rw("y", &Pore::y, "Centre y coordinate.")
-      .def_rw("z", &Pore::z, "Centre z coordinate.")
+      .def_rw("y", &Pore::y, "Centre y coordinate (physical units of origin_zyx / spacing_zyx).")
+      .def_rw("z", &Pore::z, "Centre z coordinate (physical units of origin_zyx / spacing_zyx).")
       .def_rw("radius", &Pore::radius,
               "Inscribed-sphere radius = the SDF value at the peak voxel (physical units).")
       .def("__repr__", [](const Pore& p) {
@@ -289,8 +289,8 @@ NB_MODULE(_pnm, m) {
       "the local SDF maximum; solid voxels (sdf <= 0) carry the NEGATIVE id -1, -2, ... of their "
       "connected solid grain (26-connected components of the deep solid, sdf < -1.5 * min "
       "spacing, flooded outwards by a Jacobi min-label sweep), and 0 marks solid debris no grain "
-      "reached. Periodic in all three directions. spacing_zyx only sets the deep-solid marker "
-      "threshold.");
+      "reached. Periodic in all three directions. spacing_zyx (the cell size per axis, in the "
+      "SDF's length units) only sets the deep-solid marker threshold.");
 
   m.def(
       "extract_topology",
@@ -455,7 +455,8 @@ NB_MODULE(_pnm, m) {
       nb::arg("spacing_zyx"),
       "Distributed fused extraction (collective over MPI_COMM_WORLD). sdf_local is this rank's "
       "ORB block (Nz,Ny,Nx C-order, from mpi_block); origin_zyx / spacing_zyx are the GLOBAL "
-      "grid's. Returns the tuple (pores, segmentation, connections), in that order: the pores "
+      "grid's, in the SDF's length units (as for extract_pore_network). Returns the tuple "
+      "(pores, segmentation, connections), in that order: the pores "
       "whose peak this rank owns (list[Pore]), this rank's block of the segmentation (int32 "
       "array of sdf_local.shape, global label ids), and the GLOBAL connection list ((M,2) int32, "
       "identical on every rank). Bit-exact to the single-rank extract_pore_network on the "
