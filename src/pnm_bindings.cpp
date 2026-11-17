@@ -58,6 +58,9 @@
 namespace nb = nanobind;
 using pnm::Pore;
 
+#include "pnm_bindings_checks.hpp"  // input validation of the entry points (ValueError)
+namespace chk = pnm::binding_checks;
+
 #ifdef PECLET_PNM_MPI
 // Ensure MPI_Init has been called (mirrors the flow/dem idiom); safe to call repeatedly. If WE
 // initialized MPI (no mpi4py in the driver), also finalize it at exit so mpirun sees a clean
@@ -234,13 +237,10 @@ NB_MODULE(_pnm, m) {
                    "no axis order is implied and no _zyx suffix applies — the documented "
                    "exception to NAMING.md 1.7.")
       .def(nb::init<>())
-      .def(
-          "__init__",
-          [](Pore* p, float x, float y, float z, float radius) { new (p) Pore{x, y, z, radius}; },
-          nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("radius"))
+      .def("__init__", &chk::initPore, nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("radius"))
       .def_rw("x", &Pore::x, "Centre x coordinate (physical units of origin_zyx / spacing_zyx).")
-      .def_rw("y", &Pore::y, "Centre y coordinate.")
-      .def_rw("z", &Pore::z, "Centre z coordinate.")
+      .def_rw("y", &Pore::y, "Centre y coordinate (physical units of origin_zyx / spacing_zyx).")
+      .def_rw("z", &Pore::z, "Centre z coordinate (physical units of origin_zyx / spacing_zyx).")
       .def_rw("radius", &Pore::radius,
               "Inscribed-sphere radius = the SDF value at the peak voxel (physical units).")
       .def("__repr__", [](const Pore& p) {
@@ -254,6 +254,7 @@ NB_MODULE(_pnm, m) {
       "extract_pores",
       [](nb::ndarray<float, nb::c_contig> sdf, std::vector<double> origin_zyx,
          std::vector<double> spacing_zyx) {
+        chk::grid("extract_pores", origin_zyx, spacing_zyx);
         std::array<int, 3> res;
         auto v = to_sdf(sdf, res);
         std::array<float, 3> org{(float)origin_zyx[2], (float)origin_zyx[1], (float)origin_zyx[0]};
@@ -272,6 +273,7 @@ NB_MODULE(_pnm, m) {
   m.def(
       "segment_volume",
       [](nb::ndarray<float, nb::c_contig> sdf, std::vector<double> spacing_zyx) {
+        chk::spacingZyx("segment_volume", spacing_zyx);
         std::array<int, 3> res;
         auto v = to_sdf(sdf, res);
         std::array<float, 3> spc{(float)spacing_zyx[2], (float)spacing_zyx[1],
@@ -287,13 +289,14 @@ NB_MODULE(_pnm, m) {
       "the local SDF maximum; solid voxels (sdf <= 0) carry the NEGATIVE id -1, -2, ... of their "
       "connected solid grain (26-connected components of the deep solid, sdf < -1.5 * min "
       "spacing, flooded outwards by a Jacobi min-label sweep), and 0 marks solid debris no grain "
-      "reached. Periodic in all three directions. spacing_zyx only sets the deep-solid marker "
-      "threshold.");
+      "reached. Periodic in all three directions. spacing_zyx (the cell size per axis, in the "
+      "SDF's length units) only sets the deep-solid marker threshold.");
 
   m.def(
       "extract_topology",
       [](nb::ndarray<const int, nb::c_contig> segmentation,
          std::optional<std::vector<int>> shape_zyx) {
+        chk::topologyShape(shape_zyx);
         std::array<int, 3> res;
         if (segmentation.ndim() == 3) {
           res = {(int)segmentation.shape(2), (int)segmentation.shape(1),
@@ -330,6 +333,7 @@ NB_MODULE(_pnm, m) {
       "extract_pore_network",
       [](nb::ndarray<float, nb::c_contig> sdf, std::vector<double> origin_zyx,
          std::vector<double> spacing_zyx) {
+        chk::grid("extract_pore_network", origin_zyx, spacing_zyx);
         std::array<int, 3> res;
         auto v = to_sdf(sdf, res);
         std::array<float, 3> org{(float)origin_zyx[2], (float)origin_zyx[1], (float)origin_zyx[0]};
@@ -413,6 +417,7 @@ NB_MODULE(_pnm, m) {
         ensure_mpi_init();
         if (global_shape_zyx.size() != 3)
           throw std::runtime_error("global_shape_zyx must be (Nz, Ny, Nx)");
+        chk::globalShapeZyx("mpi_block", global_shape_zyx, /*sized=*/true);
         std::array<int, 3> gd{global_shape_zyx[2], global_shape_zyx[1], global_shape_zyx[0]};
         std::array<int, 3> o{}, s{};
         pnm::mpi_block_of(gd, MPI_COMM_WORLD, o, s);
@@ -429,6 +434,8 @@ NB_MODULE(_pnm, m) {
       "extract_pore_network_mpi",
       [](nb::ndarray<float, nb::c_contig> sdf_local, std::vector<int> global_shape_zyx,
          std::vector<double> origin_zyx, std::vector<double> spacing_zyx) {
+        chk::globalShapeZyx("extract_pore_network_mpi", global_shape_zyx, /*sized=*/false);
+        chk::grid("extract_pore_network_mpi", origin_zyx, spacing_zyx);
         ensure_mpi_init();
         std::array<int, 3> res;
         auto v = to_sdf(sdf_local, res);
@@ -448,7 +455,8 @@ NB_MODULE(_pnm, m) {
       nb::arg("spacing_zyx"),
       "Distributed fused extraction (collective over MPI_COMM_WORLD). sdf_local is this rank's "
       "ORB block (Nz,Ny,Nx C-order, from mpi_block); origin_zyx / spacing_zyx are the GLOBAL "
-      "grid's. Returns the tuple (pores, segmentation, connections), in that order: the pores "
+      "grid's, in the SDF's length units (as for extract_pore_network). Returns the tuple "
+      "(pores, segmentation, connections), in that order: the pores "
       "whose peak this rank owns (list[Pore]), this rank's block of the segmentation (int32 "
       "array of sdf_local.shape, global label ids), and the GLOBAL connection list ((M,2) int32, "
       "identical on every rank). Bit-exact to the single-rank extract_pore_network on the "

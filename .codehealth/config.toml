@@ -1,0 +1,187 @@
+# cce-code-health gate for peclet.pnm (https://github.com/computational-chemical-engineering/cce-code-health).
+# Copied from pnm-health b65b4a2 for the user-facing round (WO-33), plus the nb_signatures reference tier at
+# the end. Adapted from dem's (dem-health 3fd9b93). Measured on SMM-TRS2 2026-11-14 (cold head, load ~30 on 48 cores):
+# clang_format 0.2 s, build_host 25 s, ctest_host 9 tests 15 s, state_hash 381 s (two head runs; the single-rank
+# packing_ring paths take ~145 s of each at one thread, np2 ~55 s), build_cuda 45 s, clang_tidy 51 s (497 warnings).
+#
+# Run with PECLET_SUITE=<suite checkout> set. Every configure pins core's headers to $PECLET_SUITE/core:
+# the base side builds under <git-common-dir>/codehealth/base-<sha>, where the sibling ../core is absent, and
+# cmake/PecletDeps.cmake would otherwise silently FETCH core at PECLET_CORE_TAG (an older core than the
+# head side's sibling) -- the two sides would compile different programs. The packing_ring input is passed by
+# absolute path for the same reason: its in-tree default (../flow/data, relative to the source tree) does not
+# exist in the base worktree, so the base would skip the case the head runs.
+#
+# Traps encoded below (dem hit each one on 2026-11-13):
+#  - OMP_NUM_THREADS=1: the test battery and state_hash are bitwise only at one thread, and an unbounded
+#    pool per MPI rank turns seconds into hours.
+#  - MPIEXEC_PREFLAGS takes a SPACE ("--bind-to none"): tests/kokkos_mpi splits it with separate_arguments;
+#    the ';' list form reaches mpirun as one bad option. MPIEXEC_EXECUTABLE is forced to /usr/bin/mpirun
+#    (another mpiexec on PATH runs singletons; pnm CLAUDE.md).
+#  - ctest exits 0 when a test is skipped (packing_ring exits 77 without its VTI) -> fail_regex.
+#  - state_hash prints "SKIPPED" for packing_ring without its VTI and for the MPI cases without
+#    PECLET_PNM_MPI -> fail_regex. It has no --save: stdout is the reference output.
+#  - nvcc from /usr/local/cuda (13.5).
+#  - clang-tidy (clang 19) cannot find GCC's omp.h; it is added with -isystem.
+schema = 1
+
+[profiles]
+python = "python@0"
+cpp = "cpp@0"
+
+[scope]
+include = ["src/*"]
+
+[gate]
+frozen = ["cmake/*", "CMakeLists.txt", "tests/regression/*", "CLAUDE.md"]
+forbid = ["tests/*", "packaging/*", "pyproject.toml"]
+literals = false
+public_api = false
+flags = true
+keep_going = false
+# The suite venv supplies nanobind (found through the active interpreter), python, numpy, mpi4py and clang-format.
+prefix = ': "${PECLET_SUITE:?set PECLET_SUITE to the suite checkout}" && export VIRTUAL_ENV="$PECLET_SUITE/.venv" PATH="$PECLET_SUITE/.venv/bin:$PATH" &&'
+
+[gate.env]
+OMP_NUM_THREADS = "1"
+OMP_PROC_BIND = "false"
+OPENBLAS_NUM_THREADS = "1"
+MKL_NUM_THREADS = "1"
+PYTHONHASHSEED = "0"
+
+# pnm's CI format job is BLOCKING (quality.yml, clang-format 18.1.8 = the suite venv's); same file set.
+[[gate.tier]]
+name = "clang_format"
+kind = "command"
+behaviour = false
+cadence = "step"
+timeout = 120
+cmd = '''cd {repo} && $PECLET_SUITE/.venv/bin/clang-format --dry-run --Werror \
+  $(git ls-files 'src/*.hpp' 'src/*.h' 'src/*.cpp' 'tests/*.hpp' 'tests/*.cpp')'''
+
+[[gate.tier]]
+name = "build_host"
+kind = "command"
+behaviour = false
+cadence = "step"
+timeout = 900
+cmd = '''cmake -S {repo} -B {repo}/build_health_host -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=$PECLET_SUITE/extern/install/host-openmp \
+  "-DFETCHCONTENT_SOURCE_DIR_PECLET_SIB_PECLET-CORE=$PECLET_SUITE/core" -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+  -DPECLET_PNM_BUILD_TESTS=ON -DPECLET_PNM_MPI=ON -DMPIEXEC_EXECUTABLE=/usr/bin/mpirun "-DMPIEXEC_PREFLAGS=--bind-to none" \
+  -DPECLET_PNM_PACKING_RING_VTI=$PECLET_SUITE/flow/data/packing_ring.vti \
+  -DCMAKE_CXX_FLAGS=-ffp-contract=off -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  && cmake --build {repo}/build_health_host -j32'''
+
+[[gate.tier]]
+name = "ctest_host"
+kind = "command"
+cadence = "step"
+timeout = 2400
+skip_exit = 77
+fail_regex = '\*\*\*Skipped|Not Run|No tests were found'
+detect_exit = [8]
+cmd = '''cmake -S {repo} -B {repo}/build_health_host -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=$PECLET_SUITE/extern/install/host-openmp \
+  "-DFETCHCONTENT_SOURCE_DIR_PECLET_SIB_PECLET-CORE=$PECLET_SUITE/core" -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+  -DPECLET_PNM_BUILD_TESTS=ON -DPECLET_PNM_MPI=ON -DMPIEXEC_EXECUTABLE=/usr/bin/mpirun "-DMPIEXEC_PREFLAGS=--bind-to none" \
+  -DPECLET_PNM_PACKING_RING_VTI=$PECLET_SUITE/flow/data/packing_ring.vti \
+  -DCMAKE_CXX_FLAGS=-ffp-contract=off -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null \
+  && cmake --build {repo}/build_health_host -j32 >/dev/null \
+  && PYTHONPATH={repo}/build_health_host \
+     ctest --test-dir {repo}/build_health_host -LE bench -j1 --timeout 1200 --output-on-failure'''
+
+[[gate.tier]]
+name = "state_hash"
+kind = "reference"
+cadence = "step"
+timeout = 900
+fail_regex = 'SKIPPED'
+# Alarm for a dependency resolved differently at base and head (e.g. a FetchContent fallback): the
+# '[peclet] ...' configure lines (printed on EVERY configure) must match. The configure is not silenced here.
+# Except "vendored peclet-core headers": a head worktree that is a sibling of suite/core takes ../core/include
+# silently, while the base worktree (under .git/codehealth, no sibling) prints that line for the same
+# directory, $PECLET_SUITE/core/include, pinned by FETCHCONTENT_SOURCE_DIR (WO-33 gate, 11-17).
+same_lines = '^-- \[peclet\] (?!vendored peclet-core headers -> )'
+outputs = ["hashes.txt"]
+cmd = '''cmake -S {repo} -B {repo}/build_health_host -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=$PECLET_SUITE/extern/install/host-openmp \
+  "-DFETCHCONTENT_SOURCE_DIR_PECLET_SIB_PECLET-CORE=$PECLET_SUITE/core" -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+  -DPECLET_PNM_BUILD_TESTS=ON -DPECLET_PNM_MPI=ON -DMPIEXEC_EXECUTABLE=/usr/bin/mpirun "-DMPIEXEC_PREFLAGS=--bind-to none" \
+  -DPECLET_PNM_PACKING_RING_VTI=$PECLET_SUITE/flow/data/packing_ring.vti \
+  -DCMAKE_CXX_FLAGS=-ffp-contract=off -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  && cmake --build {repo}/build_health_host -j32 >/dev/null \
+  && PYTHONPATH={repo}/build_health_host \
+     python {repo}/tests/regression/state_hash.py $PECLET_SUITE/flow/data/packing_ring.vti > {out}/hashes.txt \
+  && cat {out}/hashes.txt'''
+
+[[gate.tier]]
+name = "build_cuda"
+kind = "command"
+behaviour = false
+cadence = "step"
+timeout = 1200
+cmd = '''PATH=/usr/local/cuda/bin:$PATH cmake -S {repo} -B {repo}/build_health_cuda -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=$PECLET_SUITE/extern/install/nvidia-cuda \
+  "-DFETCHCONTENT_SOURCE_DIR_PECLET_SIB_PECLET-CORE=$PECLET_SUITE/core" -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+  -DPECLET_PNM_BUILD_TESTS=ON -DPECLET_PNM_MPI=ON -DMPIEXEC_EXECUTABLE=/usr/bin/mpirun "-DMPIEXEC_PREFLAGS=--bind-to none" \
+  && PATH=/usr/local/cuda/bin:$PATH cmake --build {repo}/build_health_cuda -j32'''
+
+[[gate.tier]]
+name = "clang_tidy"
+kind = "findings"
+cadence = "campaign"
+format = "gcc"
+ignore_exit = true
+timeout = 3600
+cmd = '''cmake -S {repo} -B {repo}/build_health_tidy -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=$PECLET_SUITE/extern/install/host-openmp \
+  "-DFETCHCONTENT_SOURCE_DIR_PECLET_SIB_PECLET-CORE=$PECLET_SUITE/core" -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+  -DPECLET_PNM_MPI=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null \
+  && ${CLANG_TIDY:-/usr/bin/clang-tidy} -p {repo}/build_health_tidy --quiet \
+     "--extra-arg=-isystem$(dirname "$(gcc -print-file-name=include/omp.h)")" \
+     {repo}/src/pnm_bindings.cpp {repo}/src/sdf_reader.cpp'''
+
+# API identity (RULES "Gating a user-facing round"): every public name's nanobind signature and defaults,
+# docstrings excluded, from the MPI host build. A user-facing round may change docstrings and add checks, never
+# a name, a parameter, a default or a return type; base and head must print the same bytes.
+[[gate.tier]]
+name = "nb_signatures"
+kind = "reference"
+cadence = "step"
+timeout = 900
+outputs = ["signatures.txt"]
+cmd = '''cmake -S {repo} -B {repo}/build_health_host -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=$PECLET_SUITE/extern/install/host-openmp \
+  "-DFETCHCONTENT_SOURCE_DIR_PECLET_SIB_PECLET-CORE=$PECLET_SUITE/core" -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+  -DPECLET_PNM_BUILD_TESTS=ON -DPECLET_PNM_MPI=ON -DMPIEXEC_EXECUTABLE=/usr/bin/mpirun "-DMPIEXEC_PREFLAGS=--bind-to none" \
+  -DPECLET_PNM_PACKING_RING_VTI=$PECLET_SUITE/flow/data/packing_ring.vti \
+  -DCMAKE_CXX_FLAGS=-ffp-contract=off -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null \
+  && cmake --build {repo}/build_health_host -j32 >/dev/null \
+  && PYTHONPATH={repo}/build_health_host python - > {out}/signatures.txt <<'PY' || exit 1
+import peclet.pnm._pnm as m
+
+
+def sig(f):
+    s = getattr(f, "__nb_signature__", None) if f is not None else None
+    return [f"{t[0]} defaults={t[2]!r}" for t in s] if s else []
+
+
+out = []
+for n in sorted(dir(m)):
+    if n.startswith("__"):
+        continue
+    o = getattr(m, n)
+    if isinstance(o, type):
+        out.append(f"class {n}")
+        for k, v in sorted(o.__dict__.items()):
+            if isinstance(v, property):
+                out += [f"  {n}.{k}.{p} {s}" for p in ("fget", "fset") for s in sig(getattr(v, p))]
+            else:
+                out += [f"  {n}.{k} {s}" for s in sig(getattr(v, "__func__", v))]
+    elif sig(o):
+        out += [f"{n} {s}" for s in sig(o)]
+    else:
+        out.append(f"{n} = <{type(o).__name__}>")
+print("\n".join(out))
+PY
+test -s {out}/signatures.txt && cat {out}/signatures.txt'''
