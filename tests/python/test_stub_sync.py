@@ -21,18 +21,20 @@ def _public(name):
     return not name.startswith("_") or name == "__init__"
 
 
+def _members(cls):
+    return {f"{cls.name}.{m.name}" for m in cls.body
+            if isinstance(m, ast.FunctionDef) and _public(m.name)}
+
+
 def _stub_names():
-    tree = ast.parse(STUB.read_text())
     names = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+    for node in ast.parse(STUB.read_text()).body:
+        if isinstance(node, ast.ClassDef):
+            names |= {node.name} | _members(node)
+        elif isinstance(node, ast.FunctionDef):
             names.add(node.name)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             names.add(node.target.id)
-        if isinstance(node, ast.ClassDef):
-            for member in node.body:
-                if isinstance(member, ast.FunctionDef) and _public(member.name):
-                    names.add(f"{node.name}.{member.name}")
     return names
 
 

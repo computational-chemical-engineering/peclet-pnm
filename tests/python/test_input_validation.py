@@ -17,8 +17,7 @@ import re
 
 import numpy as np
 import pytest
-
-import peclet.pnm as pnm
+from peclet import pnm
 
 NAN, INF = math.nan, math.inf
 N = 8
