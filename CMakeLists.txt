@@ -141,6 +141,14 @@ if(PECLET_PNM_BUILD_TESTS)
   set_tests_properties(pnm_python_smoke pnm_python_packing_ring PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
   set_tests_properties(pnm_python_packing_ring PROPERTIES SKIP_RETURN_CODE 77)
+  # The entry points refuse a wrong-length triple, NaN/Inf, a non-positive spacing or a negative
+  # count with ValueError naming the parameter, and a valid call still passes
+  # (src/pnm_bindings_checks.hpp).
+  add_test(NAME pnm_python_input_validation
+           COMMAND "${Python_EXECUTABLE}" -m pytest -q -p no:cacheprovider
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_input_validation.py")
+  set_tests_properties(pnm_python_input_validation PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
 # --- pip / scikit-build-core install rule -------------------------------------------------------
