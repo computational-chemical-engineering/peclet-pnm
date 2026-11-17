@@ -98,7 +98,10 @@ timeout = 900
 fail_regex = 'SKIPPED'
 # Alarm for a dependency resolved differently at base and head (e.g. a FetchContent fallback): the
 # '[peclet] ...' configure lines (printed on EVERY configure) must match. The configure is not silenced here.
-same_lines = '^-- \[peclet\] '
+# Except "vendored peclet-core headers": a head worktree that is a sibling of suite/core takes ../core/include
+# silently, while the base worktree (under .git/codehealth, no sibling) prints that line for the same
+# directory, $PECLET_SUITE/core/include, pinned by FETCHCONTENT_SOURCE_DIR (WO-33 gate, 11-17).
+same_lines = '^-- \[peclet\] (?!vendored peclet-core headers -> )'
 outputs = ["hashes.txt"]
 cmd = '''cmake -S {repo} -B {repo}/build_health_host -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH=$PECLET_SUITE/extern/install/host-openmp \
