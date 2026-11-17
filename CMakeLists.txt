@@ -91,6 +91,15 @@ set_target_properties(pnm PROPERTIES OUTPUT_NAME _pnm        # -> peclet.pnm._pn
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/peclet/pnm")
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/packaging/pnm_init.py
                ${CMAKE_CURRENT_BINARY_DIR}/peclet/pnm/__init__.py COPYONLY)
+# Type stub of the extension (packaging/_pnm.pyi), staged beside it with the PEP 561 marker. It is
+# generated against an MPI-enabled host build, so it also lists the distributed names; after
+# changing a binding, regenerate it and drop the build-specific constant value:
+#   PYTHONPATH=<build> python -m nanobind.stubgen -m peclet.pnm._pnm -o packaging/_pnm.pyi
+#   sed -i "s/^execution_space: str = .*/execution_space: str/" packaging/_pnm.pyi
+# tests/python/test_stub_sync.py (ctest pnm_python_stub_sync) fails when a public name is missing.
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/packaging/_pnm.pyi
+               ${CMAKE_CURRENT_BINARY_DIR}/peclet/pnm/_pnm.pyi COPYONLY)
+file(TOUCH ${CMAKE_CURRENT_BINARY_DIR}/peclet/pnm/py.typed)
 target_include_directories(pnm PRIVATE src "${PECLET_CORE_INCLUDE}")
 target_link_libraries(pnm PRIVATE Kokkos::kokkos)
 # HIP/lld strictness: nanobind's --gc-sections can drop Kokkos SharedAllocationRecord<HIPSpace>
@@ -149,6 +158,12 @@ if(PECLET_PNM_BUILD_TESTS)
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_input_validation.py")
   set_tests_properties(pnm_python_input_validation PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
+  # The shipped type stub packaging/_pnm.pyi lists every public name of the extension.
+  add_test(NAME pnm_python_stub_sync
+           COMMAND "${Python_EXECUTABLE}" -m pytest -q -p no:cacheprovider
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_stub_sync.py")
+  set_tests_properties(pnm_python_stub_sync PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
 # --- pip / scikit-build-core install rule -------------------------------------------------------
@@ -156,4 +171,7 @@ if(DEFINED SKBUILD)
   install(TARGETS pnm LIBRARY DESTINATION peclet/pnm COMPONENT python)
   install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/packaging/pnm_init.py
           DESTINATION peclet/pnm RENAME __init__.py COMPONENT python)
+  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/packaging/_pnm.pyi
+                ${CMAKE_CURRENT_BINARY_DIR}/peclet/pnm/py.typed
+          DESTINATION peclet/pnm COMPONENT python)
 endif()

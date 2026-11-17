@@ -150,8 +150,8 @@ jobs:
           OMP_PROC_BIND: "false"
         run: ctest --test-dir build -L mpi --timeout 1200 --output-on-failure -j1
 
-      - name: Python smoke and input validation against the MPI-enabled module
+      - name: Python smoke, input validation and stub sync against the MPI-enabled module
         env:
           OMP_NUM_THREADS: "2"
           OMP_PROC_BIND: "false"
-        run: ctest --test-dir build -R 'pnm_python_(smoke|input_validation)' --timeout 1200 --output-on-failure -j1
+        run: ctest --test-dir build -R 'pnm_python_(smoke|input_validation|stub_sync)' --timeout 1200 --output-on-failure -j1
